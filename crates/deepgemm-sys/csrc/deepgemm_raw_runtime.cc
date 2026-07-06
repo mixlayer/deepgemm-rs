@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <unordered_map>
@@ -26,6 +27,13 @@ std::string g_cutlass_util_include_path;
 int g_num_sms_override = 0;
 bool g_pdl_enabled = false;
 std::unordered_map<std::string, std::shared_ptr<KernelRuntime>> g_kernel_cache;
+
+struct CompilerConfig {
+  std::filesystem::path nvcc;
+  std::string flags;
+};
+
+std::optional<CompilerConfig> g_compiler_config_cache;
 
 void* cuda_driver_handle() {
   static void* handle = nullptr;
@@ -225,6 +233,24 @@ std::string compiler_flags(const std::filesystem::path& nvcc) {
   return flags;
 }
 
+CompilerConfig compiler_config() {
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mutex);
+    if (g_compiler_config_cache.has_value()) {
+      return *g_compiler_config_cache;
+    }
+  }
+
+  CompilerConfig config{nvcc_path(), ""};
+  config.flags = compiler_flags(config.nvcc);
+
+  std::lock_guard<std::mutex> lock(g_runtime_mutex);
+  if (!g_compiler_config_cache.has_value()) {
+    g_compiler_config_cache = config;
+  }
+  return *g_compiler_config_cache;
+}
+
 void write_file(const std::filesystem::path& path, const std::string& contents) {
   std::ofstream out(path, std::ios::binary);
   if (!out.write(contents.data(), static_cast<std::streamsize>(contents.size()))) {
@@ -358,6 +384,7 @@ void runtime_init(const std::string& deepgemm_root, const std::string& cuda_home
   g_include_path = (root / "deep_gemm/include").string();
   g_cutlass_include_path = (root / "third-party/cutlass/include").string();
   g_cutlass_util_include_path = (root / "third-party/cutlass/tools/util/include").string();
+  g_compiler_config_cache.reset();
 }
 
 bool runtime_is_initialized() {
@@ -434,9 +461,8 @@ std::shared_ptr<KernelRuntime> build_kernel(
     throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "deepgemm_init must be called before launching kernels");
   }
 
-  const auto nvcc = nvcc_path();
-  const auto flags = compiler_flags(nvcc);
-  const auto cache_key = name + "$$" + nvcc.string() + "$$" + flags + "$$" + code;
+  const auto config = compiler_config();
+  const auto cache_key = name + "$$" + config.nvcc.string() + "$$" + config.flags + "$$" + code;
   const auto hash = hex_u64(fnv1a64(cache_key));
   const auto dir_path = cache_root() / "cache" / ("kernel." + name + "." + hash);
   if (auto runtime = load_cached_kernel(cache_key, dir_path)) {
@@ -455,9 +481,9 @@ std::shared_ptr<KernelRuntime> build_kernel(
 
   const auto command =
       "cd " + shell_quote(tmp_root.string()) + " && " +
-      shell_quote(nvcc.string()) + " " +
+      shell_quote(config.nvcc.string()) + " " +
       shell_quote(code_path.string()) + " -cubin -o " +
-      shell_quote(cubin_path.string()) + " " + flags;
+      shell_quote(cubin_path.string()) + " " + config.flags;
   if (env_int("DG_JIT_DEBUG") || env_int("DG_JIT_PRINT_COMPILER_COMMAND")) {
     std::fprintf(stderr, "Running NVCC command: %s\n", command.c_str());
   }
