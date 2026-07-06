@@ -11,5 +11,8 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+candle = { git = "https://github.com/mixlayer/candle", package = "candle-core", branch = "fix/add-i16-i32-cuda-kernels", features = ["cuda"] }
 deepgemm-sys = { path = "crates/deepgemm-sys" }
 deepgemm = { path = "crates/deepgemm" }
+float8 = { version = "0.6.0", features = ["cuda"] }
+half = "2.4.1"

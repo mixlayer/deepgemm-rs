@@ -4,4 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+candle.workspace = true
 deepgemm.workspace = true
+float8.workspace = true
+half.workspace = true
