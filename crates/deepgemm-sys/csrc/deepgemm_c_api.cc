@@ -319,7 +319,7 @@ extern "C" deepgemm_status_t deepgemm_fp8_fp4_paged_mqa_logits(
   if (params == nullptr) {
     return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "paged MQA logits params must not be null");
   }
-  return set_error(
-      DEEPGEMM_STATUS_INTERNAL_ERROR,
-      "DeepGEMM paged MQA logits launch is not wired in the native shim yet");
+  return ffi_call([&]() {
+    deepgemm_rs::launch_fp8_fp4_paged_mqa_logits(*params);
+  });
 }

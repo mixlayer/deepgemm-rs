@@ -307,6 +307,89 @@ std::string sm100_metadata_code(
   return code.str();
 }
 
+std::string sm90_paged_mqa_logits_code(
+    int next_n,
+    int num_heads,
+    int head_dim,
+    int block_kv,
+    bool is_context_lens_2d,
+    bool is_varlen,
+    int num_q_stages,
+    int num_kv_stages,
+    int split_kv,
+    int num_specialized_threads,
+    int num_math_threads,
+    deepgemm_dtype_t logits_dtype) {
+  std::ostringstream code;
+  code
+      << "#include <deep_gemm/impls/sm90_fp8_paged_mqa_logits.cuh>\n\n"
+      << "using namespace deep_gemm;\n\n"
+      << "static void __instantiate_kernel() {\n"
+      << "    auto ptr = reinterpret_cast<void*>(&sm90_fp8_paged_mqa_logits<\n"
+      << "        " << next_n << ", " << num_heads << ",\n"
+      << "        " << head_dim << ", " << block_kv << ",\n"
+      << "        " << bool_literal(is_context_lens_2d) << ", "
+      << bool_literal(is_varlen) << ",\n"
+      << "        " << num_q_stages << ", " << num_kv_stages << ",\n"
+      << "        " << split_kv << ",\n"
+      << "        " << num_specialized_threads << ", " << num_math_threads << ",\n"
+      << "        " << kernel_dtype_name(logits_dtype) << "\n"
+      << "    >);\n"
+      << "};\n";
+  return code.str();
+}
+
+std::string sm100_paged_mqa_logits_code(
+    bool is_fp4,
+    int tokens_per_request,
+    int num_heads,
+    int head_dim,
+    int page_kv,
+    bool is_context_lens_2d,
+    bool is_varlen,
+    int num_q_stages,
+    int num_kv_stages,
+    int split_kv,
+    int splits_per_chunk,
+    int num_specialized_threads,
+    int num_math_threads,
+    deepgemm_dtype_t logits_dtype,
+    deepgemm_dtype_t weights_dtype) {
+  std::ostringstream code;
+  code
+      << "#include <deep_gemm/impls/sm100_mqa_logits.cuh>\n\n"
+      << "using namespace deep_gemm;\n\n"
+      << "static void __instantiate_kernel() {\n"
+      << "    auto ptr = reinterpret_cast<void*>(&sm100_paged_mqa_logits<\n"
+      << "        " << bool_literal(is_fp4) << ",\n"
+      << "        " << tokens_per_request << ", " << num_heads << ",\n"
+      << "        " << head_dim << ", " << page_kv << ",\n"
+      << "        " << bool_literal(is_context_lens_2d) << ", "
+      << bool_literal(is_varlen) << ",\n"
+      << "        " << num_q_stages << ", " << num_kv_stages << ",\n"
+      << "        " << split_kv << ", " << splits_per_chunk << ",\n"
+      << "        " << num_specialized_threads << ", " << num_math_threads << ",\n"
+      << "        " << kernel_dtype_name(logits_dtype) << ",\n"
+      << "        " << (weights_dtype == DEEPGEMM_DTYPE_BF16 ? "cutlass::bfloat16_t" : "float") << "\n"
+      << "    >);\n"
+      << "};\n";
+  return code.str();
+}
+
+int64_t paged_logits_stride(int64_t max_context_len, deepgemm_dtype_t dtype) {
+  const int64_t elem_size = dtype_element_size(dtype);
+  if (elem_size <= 0) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "invalid logits dtype");
+  }
+  constexpr int64_t split_kv = 256;
+  const int64_t stride_alignment = 1024 / elem_size;
+  return align_i64(align_i64(max_context_len, split_kv), stride_alignment);
+}
+
+const std::uint8_t* byte_ptr(const void* ptr) {
+  return reinterpret_cast<const std::uint8_t*>(ptr);
+}
+
 void launch_clean_logits(
     const deepgemm_mqa_logits_params_t& params,
     int seq_len,
@@ -684,6 +767,315 @@ void launch_sm100_metadata(
       schedule_meta);
 }
 
+void launch_sm90_fp8_paged_mqa_logits(
+    const deepgemm_paged_mqa_logits_params_t& params,
+    int batch_size,
+    int next_n,
+    int num_heads,
+    int head_dim,
+    int num_kv_blocks,
+    int block_kv,
+    int64_t stride_logits,
+    int block_table_stride,
+    int num_sms) {
+  constexpr int num_specialized_threads = 128;
+  constexpr int mma_m = 64;
+  constexpr int split_kv = 256;
+  constexpr int num_q_stages = 3;
+  constexpr int num_kv_stages = 3;
+  const int num_math_warp_groups = split_kv / mma_m;
+  const int num_math_threads = num_math_warp_groups * 128;
+  const bool is_context_lens_2d = true;
+  const bool is_varlen = false;
+  const int next_n_atom = next_n >= 2 ? 2 : 1;
+
+  const int kv_cache_stride_bytes = as_i32(params.fused_kv_cache.stride[0], "fused_kv_cache stride(0)");
+  const auto* kv_scale_data = byte_ptr(params.fused_kv_cache.data) + block_kv * head_dim;
+
+  const auto tensor_map_q = make_tma_2d_desc(
+      params.q.data,
+      params.q.dtype,
+      head_dim,
+      batch_size * next_n * num_heads,
+      head_dim,
+      next_n_atom * num_heads,
+      as_i32(params.q.stride[2], "q stride(2)"),
+      head_dim);
+  const auto tensor_map_kv = make_tma_3d_desc(
+      params.fused_kv_cache.data,
+      DEEPGEMM_DTYPE_FP8_E4M3,
+      head_dim,
+      block_kv,
+      num_kv_blocks,
+      head_dim,
+      block_kv,
+      1,
+      head_dim,
+      kv_cache_stride_bytes,
+      head_dim);
+  const auto tensor_map_kv_scales = make_tma_2d_desc(
+      kv_scale_data,
+      DEEPGEMM_DTYPE_F32,
+      block_kv,
+      num_kv_blocks,
+      block_kv,
+      1,
+      kv_cache_stride_bytes / static_cast<int>(sizeof(float)),
+      0);
+  const auto tensor_map_weights = make_tma_2d_desc(
+      params.weights.data,
+      params.weights.dtype,
+      num_heads,
+      batch_size * next_n,
+      num_heads,
+      next_n_atom,
+      as_i32(params.weights.stride[0], "weights stride(0)"),
+      0);
+
+  const int swizzle_alignment = head_dim * 8;
+  const int smem_q_size_per_stage =
+      next_n * num_heads * head_dim * static_cast<int>(dtype_element_size(params.q.dtype));
+  const int aligned_smem_weight_size_per_stage = as_i32(
+      align_i64(
+          next_n * num_heads * static_cast<int>(dtype_element_size(params.weights.dtype)),
+          swizzle_alignment),
+      "aligned SM90 paged weights smem size");
+  const int smem_q_pipe_size =
+      num_q_stages * (smem_q_size_per_stage + aligned_smem_weight_size_per_stage) +
+      as_i32(align_i64(num_q_stages * 8 * 2, swizzle_alignment), "SM90 paged q barrier smem size");
+  const int smem_kv_size_per_stage =
+      block_kv * head_dim * static_cast<int>(dtype_element_size(DEEPGEMM_DTYPE_FP8_E4M3));
+  const int aligned_smem_kv_scale_size_per_stage = as_i32(
+      align_i64(block_kv * static_cast<int>(sizeof(float)), swizzle_alignment),
+      "aligned SM90 paged kv scale smem size");
+  const int smem_kv_pipe_size =
+      num_kv_stages * (smem_kv_size_per_stage + aligned_smem_kv_scale_size_per_stage) +
+      as_i32(align_i64(num_kv_stages * 8 * 2, swizzle_alignment), "SM90 paged kv barrier smem size");
+  const int smem_umma_barriers = num_math_warp_groups * 2 * 8;
+  const int smem_tmem_ptr = 4;
+  const int smem_size =
+      smem_q_pipe_size + num_math_warp_groups * smem_kv_pipe_size + smem_umma_barriers + smem_tmem_ptr;
+
+  const auto runtime = build_kernel(
+      "sm90_fp8_paged_mqa_logits",
+      sm90_paged_mqa_logits_code(
+          next_n,
+          num_heads,
+          head_dim,
+          block_kv,
+          is_context_lens_2d,
+          is_varlen,
+          num_q_stages,
+          num_kv_stages,
+          split_kv,
+          num_specialized_threads,
+          num_math_threads,
+          params.logits.dtype));
+
+  const uint32_t batch_size_arg = static_cast<uint32_t>(batch_size);
+  const uint32_t stride_logits_arg = static_cast<uint32_t>(stride_logits);
+  const uint32_t block_table_stride_arg = static_cast<uint32_t>(block_table_stride);
+  const auto* context_lens = reinterpret_cast<const uint32_t*>(params.context_lens.data);
+  auto* logits = params.logits.data;
+  const auto* block_table = reinterpret_cast<const uint32_t*>(params.block_table.data);
+  const uint32_t* indices = nullptr;
+  const auto* schedule_meta = reinterpret_cast<const uint32_t*>(params.schedule_meta.data);
+
+  LaunchArgs launch_args;
+  launch_args.grid_x = num_sms;
+  launch_args.num_threads = num_specialized_threads + num_math_threads;
+  launch_args.smem_size = smem_size;
+  launch_args.enable_pdl = pdl_enabled();
+
+  launch_kernel(
+      runtime,
+      reinterpret_cast<CUstream>(params.stream),
+      launch_args,
+      batch_size_arg,
+      stride_logits_arg,
+      block_table_stride_arg,
+      context_lens,
+      logits,
+      block_table,
+      indices,
+      schedule_meta,
+      tensor_map_q,
+      tensor_map_kv,
+      tensor_map_kv_scales,
+      tensor_map_weights);
+}
+
+void launch_sm100_paged_mqa_logits(
+    const deepgemm_paged_mqa_logits_params_t& params,
+    bool is_fp4,
+    int batch_size,
+    int next_n,
+    int num_heads,
+    int head_dim,
+    int num_kv_blocks,
+    int page_kv,
+    int64_t stride_logits,
+    int block_table_stride,
+    int num_sms) {
+  constexpr int num_specialized_threads = 128;
+  constexpr int num_math_threads = 256;
+  constexpr int num_q_stages = 3;
+  constexpr int split_kv = 256;
+  constexpr int splits_per_chunk = 16;
+  const int num_kv_stages = is_fp4 ? 10 : 5;
+  const bool is_context_lens_2d = true;
+  const bool is_varlen = params.has_indices;
+  const int block_q = 128 / num_heads;
+  const int num_q_tokens_total = batch_size * next_n;
+  const int kv_bytes_per_token = is_fp4 ? head_dim / 2 : head_dim;
+  const int kv_cache_stride_bytes = as_i32(params.fused_kv_cache.stride[0], "fused_kv_cache stride(0)");
+  const auto* kv_scale_data = byte_ptr(params.fused_kv_cache.data) + page_kv * kv_bytes_per_token;
+  const deepgemm_dtype_t kv_dtype =
+      is_fp4 ? DEEPGEMM_DTYPE_PACKED_FP4_E2M1 : DEEPGEMM_DTYPE_FP8_E4M3;
+  const deepgemm_dtype_t kv_scale_dtype =
+      is_fp4 ? DEEPGEMM_DTYPE_PACKED_UE8M0 : DEEPGEMM_DTYPE_F32;
+
+  CUtensorMap tensor_map_q{};
+  CUtensorMap tensor_map_sf_q{};
+  CUtensorMap tensor_map_kv{};
+  CUtensorMap tensor_map_sf_kv{};
+
+  if (is_fp4) {
+    tensor_map_q = make_tma_2d_desc(
+        params.q.data,
+        params.q.dtype,
+        head_dim,
+        num_q_tokens_total * num_heads,
+        head_dim,
+        block_q * num_heads,
+        as_i32(params.q.stride[2], "q stride(2)"),
+        head_dim / 2,
+        0,
+        false,
+        false);
+    tensor_map_sf_q = make_tma_2d_desc(
+        params.q_scale.data,
+        params.q_scale.dtype,
+        num_heads,
+        num_q_tokens_total,
+        num_heads,
+        block_q,
+        as_i32(params.q_scale.stride[1], "q_scale stride(1)"),
+        0);
+    tensor_map_kv = make_tma_3d_desc(
+        params.fused_kv_cache.data,
+        kv_dtype,
+        head_dim,
+        page_kv,
+        num_kv_blocks,
+        head_dim,
+        page_kv,
+        1,
+        kv_bytes_per_token,
+        kv_cache_stride_bytes,
+        head_dim / 2,
+        0,
+        false,
+        false);
+  } else {
+    tensor_map_q = make_tma_2d_desc(
+        params.q.data,
+        params.q.dtype,
+        head_dim,
+        num_q_tokens_total * num_heads,
+        head_dim,
+        block_q * num_heads,
+        as_i32(params.q.stride[2], "q stride(2)"),
+        head_dim);
+    tensor_map_kv = make_tma_3d_desc(
+        params.fused_kv_cache.data,
+        kv_dtype,
+        head_dim,
+        page_kv,
+        num_kv_blocks,
+        head_dim,
+        page_kv,
+        1,
+        kv_bytes_per_token,
+        kv_cache_stride_bytes,
+        head_dim);
+  }
+
+  tensor_map_sf_kv = make_tma_2d_desc(
+      kv_scale_data,
+      kv_scale_dtype,
+      page_kv,
+      num_kv_blocks,
+      page_kv,
+      1,
+      kv_cache_stride_bytes / static_cast<int>(sizeof(int)),
+      0);
+  if (!is_fp4) {
+    tensor_map_sf_q = tensor_map_sf_kv;
+  }
+  const auto tensor_map_weights = make_tma_2d_desc(
+      params.weights.data,
+      params.weights.dtype,
+      num_heads,
+      num_q_tokens_total,
+      num_heads,
+      block_q,
+      as_i32(params.weights.stride[0], "weights stride(0)"),
+      0);
+
+  const auto runtime = build_kernel(
+      "sm100_paged_mqa_logits",
+      sm100_paged_mqa_logits_code(
+          is_fp4,
+          next_n,
+          num_heads,
+          head_dim,
+          page_kv,
+          is_context_lens_2d,
+          is_varlen,
+          num_q_stages,
+          num_kv_stages,
+          split_kv,
+          splits_per_chunk,
+          num_specialized_threads,
+          num_math_threads,
+          params.logits.dtype,
+          params.weights.dtype));
+
+  const uint32_t num_q_tokens_total_arg = static_cast<uint32_t>(num_q_tokens_total);
+  const uint32_t stride_logits_arg = static_cast<uint32_t>(stride_logits);
+  const uint32_t block_table_stride_arg = static_cast<uint32_t>(block_table_stride);
+  const auto* context_lens = reinterpret_cast<const uint32_t*>(params.context_lens.data);
+  auto* logits = params.logits.data;
+  const auto* block_table = reinterpret_cast<const uint32_t*>(params.block_table.data);
+  const auto* indices = is_varlen ? reinterpret_cast<const uint32_t*>(params.indices.data) : nullptr;
+  const auto* schedule_meta = reinterpret_cast<const uint32_t*>(params.schedule_meta.data);
+
+  LaunchArgs launch_args;
+  launch_args.grid_x = num_sms;
+  launch_args.num_threads = num_specialized_threads + num_math_threads;
+  launch_args.smem_size = 232448;
+  launch_args.enable_pdl = pdl_enabled();
+
+  launch_kernel(
+      runtime,
+      reinterpret_cast<CUstream>(params.stream),
+      launch_args,
+      num_q_tokens_total_arg,
+      stride_logits_arg,
+      block_table_stride_arg,
+      context_lens,
+      logits,
+      block_table,
+      indices,
+      schedule_meta,
+      tensor_map_q,
+      tensor_map_sf_q,
+      tensor_map_kv,
+      tensor_map_sf_kv,
+      tensor_map_weights);
+}
+
 }  // namespace
 
 void launch_fp8_fp4_mqa_logits(
@@ -871,6 +1263,209 @@ void launch_paged_mqa_logits_metadata(
 
   std::ostringstream message;
   message << "paged MQA metadata supports SM90 or SM100, got compute capability "
+          << device.major << "." << device.minor;
+  throw_status(DEEPGEMM_STATUS_UNSUPPORTED_ARCH, message.str());
+}
+
+void launch_fp8_fp4_paged_mqa_logits(
+    const deepgemm_paged_mqa_logits_params_t& params) {
+  const auto device = current_device_info();
+  const bool is_fp4 = params.has_q_scale;
+
+  require_contiguous(params.q, 4, "q");
+  const int64_t batch_size_i64 = params.q.shape[0];
+  const int64_t next_n_i64 = params.q.shape[1];
+  const int64_t num_heads_i64 = params.q.shape[2];
+  const int64_t physical_head_dim_i64 = params.q.shape[3];
+  const int64_t head_dim_i64 = is_fp4 ? physical_head_dim_i64 * 2 : physical_head_dim_i64;
+
+  if (is_fp4) {
+    require_dtype(params.q.dtype, DEEPGEMM_DTYPE_PACKED_FP4_E2M1, "q");
+    require_contiguous(params.q_scale, 3, "q_scale");
+    require_dtype(params.q_scale.dtype, DEEPGEMM_DTYPE_PACKED_UE8M0, "q_scale");
+    if (params.q_scale.shape[0] != batch_size_i64 ||
+        params.q_scale.shape[1] != next_n_i64 ||
+        params.q_scale.shape[2] != num_heads_i64) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "q_scale shape must be [batch_size, next_n, num_heads]");
+    }
+  } else {
+    require_dtype(params.q.dtype, DEEPGEMM_DTYPE_FP8_E4M3, "q");
+  }
+
+  require_tensor_rank(params.fused_kv_cache, 4, "fused_kv_cache");
+  require_dtype(params.fused_kv_cache.dtype, DEEPGEMM_DTYPE_U8, "fused_kv_cache");
+  require_shape_positive(params.fused_kv_cache.shape, 4, "fused_kv_cache");
+  const int64_t num_kv_blocks_i64 = params.fused_kv_cache.shape[0];
+  const int64_t block_kv_i64 = params.fused_kv_cache.shape[1];
+  const int64_t kv_bytes_per_token_i64 = is_fp4 ? head_dim_i64 / 2 : head_dim_i64;
+  const int64_t fused_bytes_per_token_i64 = kv_bytes_per_token_i64 + static_cast<int64_t>(sizeof(int));
+  if (params.fused_kv_cache.shape[2] != 1 ||
+      params.fused_kv_cache.shape[3] != fused_bytes_per_token_i64) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "fused_kv_cache shape must be [num_kv_blocks, block_kv, 1, packed_head_dim + 4]");
+  }
+  if (params.fused_kv_cache.stride[0] != block_kv_i64 * fused_bytes_per_token_i64 ||
+      params.fused_kv_cache.stride[1] != fused_bytes_per_token_i64 ||
+      params.fused_kv_cache.stride[2] != fused_bytes_per_token_i64 ||
+      params.fused_kv_cache.stride[3] != 1) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "fused_kv_cache must be contiguous [num_kv_blocks, block_kv, 1, fused_bytes]");
+  }
+  if (params.fused_kv_cache.stride[0] % static_cast<int64_t>(sizeof(int)) != 0) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "fused_kv_cache block stride must be 4-byte aligned");
+  }
+
+  require_tensor_rank(params.weights, 2, "weights");
+  require_shape_positive(params.weights.shape, 2, "weights");
+  if (params.weights.shape[0] != batch_size_i64 * next_n_i64 ||
+      params.weights.shape[1] != num_heads_i64 ||
+      params.weights.stride[1] != 1) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "weights must be [batch_size * next_n, num_heads] with stride(1) == 1");
+  }
+  if (!is_fp4 && params.weights.stride[0] != num_heads_i64) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "FP8 paged MQA weights must be contiguous");
+  }
+  if (params.weights.dtype != DEEPGEMM_DTYPE_F32 && params.weights.dtype != DEEPGEMM_DTYPE_BF16) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "weights dtype must be f32 or bf16");
+  }
+
+  require_contiguous_2d_i32(params.context_lens, "context_lens");
+  if (params.context_lens.shape[0] != batch_size_i64 ||
+      params.context_lens.shape[1] != next_n_i64) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "context_lens shape must be [batch_size, next_n]");
+  }
+
+  require_tensor_rank(params.block_table, 2, "block_table");
+  require_dtype(params.block_table.dtype, DEEPGEMM_DTYPE_I32, "block_table");
+  require_shape_positive(params.block_table.shape, 2, "block_table");
+  if (params.block_table.shape[0] != batch_size_i64 || params.block_table.stride[1] != 1) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "block_table must be [batch_size, max_block_len] with stride(1) == 1");
+  }
+
+  const int64_t num_sms_i64 = params.num_sms;
+  if (num_sms_i64 <= 0 || num_sms_i64 > device.num_sms) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "num_sms must be positive and no larger than the device SM count");
+  }
+  require_contiguous_2d_i32(params.schedule_meta, "schedule_meta");
+  if (params.schedule_meta.shape[0] != num_sms_i64 + 1 ||
+      params.schedule_meta.shape[1] != 2) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "schedule_meta shape must be [num_sms + 1, 2]");
+  }
+
+  const bool is_varlen = params.has_indices;
+  if (is_varlen) {
+    require_contiguous_1d_i32(params.indices, batch_size_i64, "indices");
+  }
+
+  require_logits_dtype(params.logits.dtype);
+  if (params.max_context_len <= 0) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "max_context_len must be positive");
+  }
+  if (params.clean_logits) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "clean_logits is not supported for 2D paged context lengths yet");
+  }
+
+  const int batch_size = as_i32(batch_size_i64, "batch_size");
+  const int next_n = as_i32(next_n_i64, "next_n");
+  const int num_heads = as_i32(num_heads_i64, "num_heads");
+  const int head_dim = as_i32(head_dim_i64, "head_dim");
+  const int num_kv_blocks = as_i32(num_kv_blocks_i64, "num_kv_blocks");
+  const int block_kv = as_i32(block_kv_i64, "block_kv");
+  const int max_context_len = as_i32(params.max_context_len, "max_context_len");
+  const int num_sms = as_i32(num_sms_i64, "num_sms");
+  const int block_table_stride = as_i32(params.block_table.stride[0], "block_table stride(0)");
+  const int64_t stride_logits = paged_logits_stride(params.max_context_len, params.logits.dtype);
+  require_logits_output(
+      params.logits,
+      batch_size_i64 * next_n_i64,
+      params.max_context_len,
+      stride_logits,
+      "logits");
+  (void)max_context_len;
+
+  if (128 % num_heads != 0) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "num_heads must divide 128");
+  }
+
+  if (device.major == 9) {
+    if (is_fp4) {
+      throw_status(DEEPGEMM_STATUS_UNSUPPORTED_ARCH, "FP4 paged MQA logits require SM100");
+    }
+    if (is_varlen) {
+      throw_status(DEEPGEMM_STATUS_UNSUPPORTED_ARCH, "SM90 paged MQA logits do not support varlen indices");
+    }
+    if (params.weights.dtype != DEEPGEMM_DTYPE_F32) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 paged MQA logits require f32 weights");
+    }
+    if (block_kv != 64) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 paged MQA logits require block_kv == 64");
+    }
+    if (next_n != 1 && next_n != 2) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 paged MQA logits require next_n == 1 or 2");
+    }
+    if ((num_heads != 32 && num_heads != 64) ||
+        (head_dim != 32 && head_dim != 64 && head_dim != 128)) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "unsupported SM90 paged MQA logits shape");
+    }
+    launch_sm90_fp8_paged_mqa_logits(
+        params,
+        batch_size,
+        next_n,
+        num_heads,
+        head_dim,
+        num_kv_blocks,
+        block_kv,
+        stride_logits,
+        block_table_stride,
+        num_sms);
+    return;
+  }
+
+  if (device.major == 10) {
+    if (params.weights.dtype == DEEPGEMM_DTYPE_BF16 && params.logits.dtype != DEEPGEMM_DTYPE_BF16) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "bf16 weights require bf16 logits");
+    }
+    if (is_varlen && next_n != 1) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM100 varlen paged MQA logits require next_n == 1");
+    }
+    if (block_kv != 32 && block_kv != 64) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM100 paged MQA logits require block_kv == 32 or 64");
+    }
+    if (num_heads != 8 && num_heads != 16 && num_heads != 32 && num_heads != 64) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM100 paged MQA logits require 8, 16, 32, or 64 heads");
+    }
+    if (is_fp4) {
+      if (head_dim != 64 && head_dim != 128) {
+        throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM100 FP4 paged MQA logits require head_dim 64 or 128");
+      }
+    } else if (head_dim != 32 && head_dim != 64 && head_dim != 128) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM100 FP8 paged MQA logits require head_dim 32, 64, or 128");
+    }
+    launch_sm100_paged_mqa_logits(
+        params,
+        is_fp4,
+        batch_size,
+        next_n,
+        num_heads,
+        head_dim,
+        num_kv_blocks,
+        block_kv,
+        stride_logits,
+        block_table_stride,
+        num_sms);
+    return;
+  }
+
+  std::ostringstream message;
+  message << "paged MQA logits supports SM90 or SM100, got compute capability "
           << device.major << "." << device.minor;
   throw_status(DEEPGEMM_STATUS_UNSUPPORTED_ARCH, message.str());
 }

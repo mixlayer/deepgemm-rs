@@ -146,6 +146,7 @@ pub struct deepgemm_paged_mqa_logits_params_t {
     pub indices: deepgemm_tensor_t,
     pub logits: deepgemm_tensor_mut_t,
     pub max_context_len: i64,
+    pub num_sms: i64,
     pub clean_logits: bool,
     pub stream: deepgemm_cuda_stream_t,
 }

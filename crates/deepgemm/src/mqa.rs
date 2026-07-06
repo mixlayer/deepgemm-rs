@@ -324,6 +324,7 @@ pub unsafe fn fp8_fp4_paged_mqa_logits(params: &PagedMqaLogitsLaunch) -> Result<
         indices: optional_tensor_arg(params.indices)?,
         logits: params.logits.to_raw()?,
         max_context_len: usize_to_i64(params.max_context_len, "max_context_len")?,
+        num_sms: usize_to_i64(params.num_sms, "num_sms")?,
         clean_logits: params.clean_logits,
         stream: params.stream,
     };
@@ -514,11 +515,14 @@ fn validate_paged_mqa_logits_spec(spec: &PagedMqaLogitsSpec, arch: Arch) -> Resu
         ],
         "fused_kv_cache tail shape",
     )?;
-    if spec.fused_kv_cache.strides[1] != spec.fused_kv_cache.shape[3] as isize
+    let fused_bytes = spec.fused_kv_cache.shape[3];
+    if spec.fused_kv_cache.strides[0] != (block_kv * fused_bytes) as isize
+        || spec.fused_kv_cache.strides[1] != fused_bytes as isize
+        || spec.fused_kv_cache.strides[2] != fused_bytes as isize
         || spec.fused_kv_cache.strides[3] != 1
     {
         return Err(Error::InvalidArgument(
-            "fused_kv_cache must have stride(1) == fused bytes and stride(3) == 1".into(),
+            "fused_kv_cache must be contiguous [num_kv_blocks, block_kv, 1, fused_bytes]".into(),
         ));
     }
 

@@ -117,6 +117,7 @@ typedef struct deepgemm_paged_mqa_logits_params_t {
   deepgemm_tensor_t indices;
   deepgemm_tensor_mut_t logits;
   int64_t max_context_len;
+  int64_t num_sms;
   bool clean_logits;
   deepgemm_cuda_stream_t stream;
 } deepgemm_paged_mqa_logits_params_t;

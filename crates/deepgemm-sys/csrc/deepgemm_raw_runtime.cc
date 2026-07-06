@@ -649,6 +649,78 @@ CUtensorMap make_tma_2d_desc(
   return tensor_map;
 }
 
+CUtensorMap make_tma_3d_desc(
+    const void* data,
+    deepgemm_dtype_t dtype,
+    int gmem_inner_dim,
+    int gmem_outer_dim,
+    int gmem_batch_dim,
+    int smem_inner_dim,
+    int smem_outer_dim,
+    int smem_batch_dim,
+    int gmem_outer_stride,
+    int gmem_batch_stride,
+    int swizzle_mode,
+    int swizzle_base,
+    bool allow_tf32,
+    bool fp4_unpacked_smem) {
+  if (data == nullptr) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "tensor map data must not be null");
+  }
+
+  const int64_t elem_size_i64 = dtype_element_size(dtype);
+  if (elem_size_i64 <= 0 || elem_size_i64 > INT32_MAX) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "invalid tensor map element size");
+  }
+  const int elem_size = static_cast<int>(elem_size_i64);
+
+  if (swizzle_mode != 0) {
+    smem_inner_dim = swizzle_mode / elem_size;
+  }
+
+  if (dtype == DEEPGEMM_DTYPE_PACKED_FP4_E2M1) {
+    if (fp4_unpacked_smem && gmem_inner_dim % 128 != 0) {
+      throw_status(
+          DEEPGEMM_STATUS_INVALID_ARGUMENT,
+          "FP4 unpacked TMA inner dimension must be a multiple of 128");
+    }
+    if (!fp4_unpacked_smem && swizzle_mode != 0) {
+      smem_inner_dim = swizzle_mode * 2;
+    }
+  }
+
+  CUtensorMap tensor_map{};
+  const cuuint64_t gmem_dims[3] = {
+      static_cast<cuuint64_t>(gmem_inner_dim),
+      static_cast<cuuint64_t>(gmem_outer_dim),
+      static_cast<cuuint64_t>(gmem_batch_dim)};
+  const cuuint32_t smem_dims[3] = {
+      static_cast<cuuint32_t>(smem_inner_dim),
+      static_cast<cuuint32_t>(smem_outer_dim),
+      static_cast<cuuint32_t>(smem_batch_dim)};
+  const cuuint64_t gmem_strides[2] = {
+      static_cast<cuuint64_t>(gmem_outer_stride) * static_cast<cuuint64_t>(elem_size),
+      static_cast<cuuint64_t>(gmem_batch_stride) * static_cast<cuuint64_t>(elem_size)};
+  const cuuint32_t elem_strides[3] = {1, 1, 1};
+
+  check_cuda(
+      lazy_cuTensorMapEncodeTiled(
+          &tensor_map,
+          tensor_map_dtype(dtype, allow_tf32, fp4_unpacked_smem),
+          3,
+          const_cast<void*>(data),
+          gmem_dims,
+          gmem_strides,
+          smem_dims,
+          elem_strides,
+          CU_TENSOR_MAP_INTERLEAVE_NONE,
+          tensor_map_swizzle(swizzle_mode, swizzle_base),
+          CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+          CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+      "cuTensorMapEncodeTiled");
+  return tensor_map;
+}
+
 KernelRuntime::KernelRuntime(std::string cubin_path) {
   check_cuda(
       lazy_cuLibraryLoadFromFile(

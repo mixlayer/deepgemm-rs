@@ -106,4 +106,20 @@ CUtensorMap make_tma_2d_desc(
     bool allow_tf32 = false,
     bool fp4_unpacked_smem = true);
 
+CUtensorMap make_tma_3d_desc(
+    const void* data,
+    deepgemm_dtype_t dtype,
+    int gmem_inner_dim,
+    int gmem_outer_dim,
+    int gmem_batch_dim,
+    int smem_inner_dim,
+    int smem_outer_dim,
+    int smem_batch_dim,
+    int gmem_outer_stride,
+    int gmem_batch_stride,
+    int swizzle_mode,
+    int swizzle_base = 0,
+    bool allow_tf32 = false,
+    bool fp4_unpacked_smem = true);
+
 }  // namespace deepgemm_rs
