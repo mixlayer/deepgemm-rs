@@ -69,6 +69,15 @@ pub struct deepgemm_tensor_layout_2d_t {
 }
 
 #[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct deepgemm_device_info_t {
+    pub device: i32,
+    pub compute_capability_major: i32,
+    pub compute_capability_minor: i32,
+    pub num_sms: i32,
+}
+
+#[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct deepgemm_mqa_logits_layout_params_t {
     pub seq_len: i64,
@@ -149,6 +158,14 @@ unsafe extern "C" {
         deepgemm_root: *const c_char,
         cuda_home: *const c_char,
     ) -> deepgemm_status_t;
+
+    pub fn deepgemm_get_device_info(out: *mut deepgemm_device_info_t) -> deepgemm_status_t;
+
+    pub fn deepgemm_get_num_sms(out: *mut i32) -> deepgemm_status_t;
+
+    pub fn deepgemm_set_num_sms(num_sms: i32) -> deepgemm_status_t;
+
+    pub fn deepgemm_set_pdl(enabled: bool) -> deepgemm_status_t;
 
     pub fn deepgemm_mqa_logits_layout(
         params: *const deepgemm_mqa_logits_layout_params_t,

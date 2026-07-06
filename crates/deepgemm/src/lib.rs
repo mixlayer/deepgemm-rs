@@ -25,6 +25,6 @@ pub use mqa::{
     logits_layout_from_sys, mqa_logits_layout, paged_mqa_logits_layout, paged_mqa_logits_metadata,
     paged_mqa_logits_metadata_layout,
 };
-pub use runtime::init;
+pub use runtime::{DeviceInfo, device_info, init, num_sms, set_num_sms, set_pdl};
 pub use source::{SourceLayout, source_layout, source_root};
 pub use tensor::{TensorArg, TensorLayout2D, TensorOut, TensorSpec};

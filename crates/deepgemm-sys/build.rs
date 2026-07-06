@@ -5,13 +5,20 @@ use std::{
 
 fn main() {
     let deepgemm_root = discover_deepgemm_root();
+    let cuda_include = discover_cuda_include();
     let manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo"),
     );
 
     println!("cargo:rerun-if-env-changed=DEEPGEMM_ROOT");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-changed=csrc/deepgemm_c_api.h");
     println!("cargo:rerun-if-changed=csrc/deepgemm_c_api.cc");
+    println!("cargo:rerun-if-changed=csrc/deepgemm_raw_runtime.h");
+    println!("cargo:rerun-if-changed=csrc/deepgemm_raw_runtime.cc");
+    println!("cargo:rerun-if-changed=csrc/deepgemm_raw_mqa.h");
+    println!("cargo:rerun-if-changed=csrc/deepgemm_raw_mqa.cc");
     println!(
         "cargo:rerun-if-changed={}",
         deepgemm_root.join("deep_gemm").join("include").display()
@@ -25,12 +32,18 @@ fn main() {
         deepgemm_root.display()
     );
     println!("cargo:metadata=source_root={}", deepgemm_root.display());
+    if cfg!(target_os = "linux") {
+        println!("cargo:rustc-link-lib=dylib=dl");
+    }
 
     cc::Build::new()
         .cpp(true)
         .std("c++17")
         .include(manifest_dir.join("csrc"))
+        .include(cuda_include)
         .file(manifest_dir.join("csrc").join("deepgemm_c_api.cc"))
+        .file(manifest_dir.join("csrc").join("deepgemm_raw_runtime.cc"))
+        .file(manifest_dir.join("csrc").join("deepgemm_raw_mqa.cc"))
         .compile("deepgemm_c_api");
 }
 
@@ -49,6 +62,37 @@ fn discover_deepgemm_root() -> PathBuf {
         manifest_dir.join("vendor").join("DeepGEMM"),
         "vendored DeepGEMM submodule",
     )
+}
+
+fn discover_cuda_include() -> PathBuf {
+    let mut candidates = Vec::new();
+    for var in ["CUDA_HOME", "CUDA_PATH"] {
+        if let Some(root) = env::var_os(var) {
+            add_cuda_include_candidates(&mut candidates, PathBuf::from(root));
+        }
+    }
+    add_cuda_include_candidates(&mut candidates, PathBuf::from("/usr/local/cuda"));
+
+    for candidate in candidates {
+        if candidate.join("cuda.h").exists() {
+            return candidate;
+        }
+    }
+
+    panic!(
+        "could not find CUDA headers. Set CUDA_HOME to a CUDA toolkit containing include/cuda.h or targets/*/include/cuda.h"
+    );
+}
+
+fn add_cuda_include_candidates(candidates: &mut Vec<PathBuf>, root: PathBuf) {
+    candidates.push(root.join("include"));
+
+    let targets = root.join("targets");
+    if let Ok(entries) = std::fs::read_dir(targets) {
+        for entry in entries.flatten() {
+            candidates.push(entry.path().join("include"));
+        }
+    }
 }
 
 fn validate_deepgemm_root(path: PathBuf, source: &str) -> PathBuf {

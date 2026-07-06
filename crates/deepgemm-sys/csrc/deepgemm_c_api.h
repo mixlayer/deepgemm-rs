@@ -53,6 +53,13 @@ typedef struct deepgemm_tensor_layout_2d_t {
   uint64_t element_count;
 } deepgemm_tensor_layout_2d_t;
 
+typedef struct deepgemm_device_info_t {
+  int32_t device;
+  int32_t compute_capability_major;
+  int32_t compute_capability_minor;
+  int32_t num_sms;
+} deepgemm_device_info_t;
+
 typedef struct deepgemm_mqa_logits_layout_params_t {
   int64_t seq_len;
   int64_t seq_len_kv;
@@ -119,6 +126,22 @@ const char* deepgemm_last_error(void);
 deepgemm_status_t deepgemm_init(
   const char* deepgemm_root,
   const char* cuda_home
+);
+
+deepgemm_status_t deepgemm_get_device_info(
+  deepgemm_device_info_t* out
+);
+
+deepgemm_status_t deepgemm_get_num_sms(
+  int32_t* out
+);
+
+deepgemm_status_t deepgemm_set_num_sms(
+  int32_t num_sms
+);
+
+deepgemm_status_t deepgemm_set_pdl(
+  bool enabled
 );
 
 deepgemm_status_t deepgemm_mqa_logits_layout(

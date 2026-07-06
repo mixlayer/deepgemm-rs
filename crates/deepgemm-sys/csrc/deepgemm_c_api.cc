@@ -1,7 +1,12 @@
 #include "deepgemm_c_api.h"
 
+#include "deepgemm_raw_mqa.h"
+#include "deepgemm_raw_runtime.h"
+
+#include <exception>
 #include <limits>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -15,6 +20,20 @@ deepgemm_status_t clear_error() {
 deepgemm_status_t set_error(deepgemm_status_t status, const char* message) {
   g_last_error = message;
   return status;
+}
+
+template <typename Fn>
+deepgemm_status_t ffi_call(Fn&& fn) {
+  try {
+    std::forward<Fn>(fn)();
+    return clear_error();
+  } catch (const deepgemm_rs::StatusError& error) {
+    return set_error(error.status(), error.what());
+  } catch (const std::exception& error) {
+    return set_error(DEEPGEMM_STATUS_INTERNAL_ERROR, error.what());
+  } catch (...) {
+    return set_error(DEEPGEMM_STATUS_INTERNAL_ERROR, "unknown native DeepGEMM error");
+  }
 }
 
 int64_t dtype_size(deepgemm_dtype_t dtype) {
@@ -116,7 +135,44 @@ extern "C" deepgemm_status_t deepgemm_init(
   if (cuda_home == nullptr || cuda_home[0] == '\0') {
     return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "cuda_home must not be empty");
   }
-  return clear_error();
+  return ffi_call([&]() {
+    deepgemm_rs::runtime_init(deepgemm_root, cuda_home);
+  });
+}
+
+extern "C" deepgemm_status_t deepgemm_get_device_info(
+    deepgemm_device_info_t* out) {
+  if (out == nullptr) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "device info output must not be null");
+  }
+  return ffi_call([&]() {
+    const auto info = deepgemm_rs::current_device_info();
+    out->device = info.device;
+    out->compute_capability_major = info.major;
+    out->compute_capability_minor = info.minor;
+    out->num_sms = info.num_sms;
+  });
+}
+
+extern "C" deepgemm_status_t deepgemm_get_num_sms(int32_t* out) {
+  if (out == nullptr) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "num_sms output must not be null");
+  }
+  return ffi_call([&]() {
+    *out = deepgemm_rs::effective_num_sms();
+  });
+}
+
+extern "C" deepgemm_status_t deepgemm_set_num_sms(int32_t num_sms) {
+  return ffi_call([&]() {
+    deepgemm_rs::set_num_sms_override(num_sms);
+  });
+}
+
+extern "C" deepgemm_status_t deepgemm_set_pdl(bool enabled) {
+  return ffi_call([&]() {
+    deepgemm_rs::set_pdl(enabled);
+  });
 }
 
 extern "C" deepgemm_status_t deepgemm_mqa_logits_layout(
@@ -243,9 +299,9 @@ extern "C" deepgemm_status_t deepgemm_fp8_fp4_mqa_logits(
   if (params == nullptr) {
     return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "MQA logits params must not be null");
   }
-  return set_error(
-      DEEPGEMM_STATUS_INTERNAL_ERROR,
-      "DeepGEMM MQA logits launch is not wired in the native shim yet");
+  return ffi_call([&]() {
+    deepgemm_rs::launch_fp8_fp4_mqa_logits(*params);
+  });
 }
 
 extern "C" deepgemm_status_t deepgemm_paged_mqa_logits_metadata(
@@ -253,9 +309,9 @@ extern "C" deepgemm_status_t deepgemm_paged_mqa_logits_metadata(
   if (params == nullptr) {
     return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "paged metadata params must not be null");
   }
-  return set_error(
-      DEEPGEMM_STATUS_INTERNAL_ERROR,
-      "DeepGEMM paged MQA logits metadata launch is not wired in the native shim yet");
+  return ffi_call([&]() {
+    deepgemm_rs::launch_paged_mqa_logits_metadata(*params);
+  });
 }
 
 extern "C" deepgemm_status_t deepgemm_fp8_fp4_paged_mqa_logits(

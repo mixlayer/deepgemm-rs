@@ -125,6 +125,15 @@ pub struct TensorLayout2D {
 }
 
 impl TensorLayout2D {
+    /// Returns the tensor spec for the logical output view.
+    pub fn logical_spec(self) -> TensorSpec<2> {
+        TensorSpec {
+            dtype: self.dtype,
+            shape: self.logical_shape,
+            strides: self.strides,
+        }
+    }
+
     /// Returns the tensor spec for the physical allocation.
     pub fn allocation_spec(self) -> TensorSpec<2> {
         TensorSpec {

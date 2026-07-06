@@ -247,6 +247,10 @@ pub fn paged_mqa_logits_layout(spec: &PagedMqaLogitsSpec, arch: Arch) -> Result<
 /// All pointers must refer to valid CUDA device buffers matching the attached shape and dtype
 /// metadata. Buffers must remain live until work enqueued on `stream` has completed.
 pub unsafe fn fp8_fp4_mqa_logits(params: &MqaLogitsLaunch) -> Result<()> {
+    let arch = crate::runtime::device_info()?.arch()?;
+    let expected_logits = mqa_logits_layout(&params.spec(), arch)?.logical_spec();
+    require_spec(params.logits.spec, expected_logits, "logits")?;
+
     let raw = deepgemm_sys::deepgemm_mqa_logits_params_t {
         q: params.q.to_raw()?,
         has_q_scale: params.q_scale.is_some(),
@@ -273,6 +277,15 @@ pub unsafe fn fp8_fp4_mqa_logits(params: &MqaLogitsLaunch) -> Result<()> {
 /// All pointers must refer to valid CUDA device buffers matching the attached shape and dtype
 /// metadata. Buffers must remain live until work enqueued on `stream` has completed.
 pub unsafe fn paged_mqa_logits_metadata(params: &PagedMqaLogitsMetadataLaunch) -> Result<()> {
+    let arch = crate::runtime::device_info()?.arch()?;
+    let expected_schedule_meta =
+        paged_mqa_logits_metadata_layout(&params.spec(), arch)?.logical_spec();
+    require_spec(
+        params.schedule_meta.spec,
+        expected_schedule_meta,
+        "schedule_meta",
+    )?;
+
     let raw = deepgemm_sys::deepgemm_paged_mqa_logits_metadata_params_t {
         context_lens: params.context_lens.to_raw()?,
         has_indices: params.indices.is_some(),
@@ -294,6 +307,10 @@ pub unsafe fn paged_mqa_logits_metadata(params: &PagedMqaLogitsMetadataLaunch) -
 /// All pointers must refer to valid CUDA device buffers matching the attached shape and dtype
 /// metadata. Buffers must remain live until work enqueued on `stream` has completed.
 pub unsafe fn fp8_fp4_paged_mqa_logits(params: &PagedMqaLogitsLaunch) -> Result<()> {
+    let arch = crate::runtime::device_info()?.arch()?;
+    let expected_logits = paged_mqa_logits_layout(&params.spec(), arch)?.logical_spec();
+    require_spec(params.logits.spec, expected_logits, "logits")?;
+
     let raw = deepgemm_sys::deepgemm_paged_mqa_logits_params_t {
         q: params.q.to_raw()?,
         has_q_scale: params.q_scale.is_some(),
@@ -594,6 +611,19 @@ fn require_shape<const RANK: usize>(
     if actual != expected {
         return Err(Error::InvalidArgument(format!(
             "{name} shape must be {expected:?}, got {actual:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_spec<const RANK: usize>(
+    actual: TensorSpec<RANK>,
+    expected: TensorSpec<RANK>,
+    name: &str,
+) -> Result<()> {
+    if actual != expected {
+        return Err(Error::InvalidArgument(format!(
+            "{name} spec must be {expected:?}, got {actual:?}"
         )));
     }
     Ok(())
