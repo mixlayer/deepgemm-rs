@@ -25,7 +25,7 @@ std::string g_cutlass_include_path;
 std::string g_cutlass_util_include_path;
 int g_num_sms_override = 0;
 bool g_pdl_enabled = false;
-std::unordered_map<std::string, std::weak_ptr<KernelRuntime>> g_kernel_cache;
+std::unordered_map<std::string, std::shared_ptr<KernelRuntime>> g_kernel_cache;
 
 void* cuda_driver_handle() {
   static void* handle = nullptr;
@@ -238,9 +238,7 @@ std::shared_ptr<KernelRuntime> load_cached_kernel(
   std::lock_guard<std::mutex> lock(g_runtime_mutex);
   auto entry = g_kernel_cache.find(cache_key);
   if (entry != g_kernel_cache.end()) {
-    if (auto runtime = entry->second.lock()) {
-      return runtime;
-    }
+    return entry->second;
   }
   if (!std::filesystem::exists(dir_path / "kernel.cubin")) {
     return nullptr;
