@@ -1,6 +1,6 @@
 # deepgemm-rs
 
-Work-in-progress Rust and Candle bindings for [DeepSeek DeepGEMM](crates/deepgemm-sys/vendor/DeepGEMM).
+Work-in-progress Rust and Candle bindings for [DeepSeek DeepGEMM](https://github.com/deepseek-ai/DeepGEMM).
 
 ### Crates
 
