@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/deepgemm-sys",
+    "crates/deepgemm",
+    "crates/candle-deepgemm",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+deepgemm-sys = { path = "crates/deepgemm-sys" }
+deepgemm = { path = "crates/deepgemm" }

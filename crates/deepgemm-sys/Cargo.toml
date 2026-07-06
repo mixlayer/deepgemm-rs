@@ -1,0 +1,11 @@
+[package]
+name = "deepgemm-sys"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+links = "deepgemm"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1.2"

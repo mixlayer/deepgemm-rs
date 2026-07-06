@@ -1,0 +1,7 @@
+[package]
+name = "candle-deepgemm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+deepgemm.workspace = true

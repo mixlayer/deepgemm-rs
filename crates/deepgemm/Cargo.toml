@@ -1,0 +1,7 @@
+[package]
+name = "deepgemm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+deepgemm-sys.workspace = true
