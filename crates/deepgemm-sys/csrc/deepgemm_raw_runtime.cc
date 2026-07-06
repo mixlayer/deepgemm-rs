@@ -138,7 +138,7 @@ std::filesystem::path cache_root() {
   if (home.empty()) {
     throw_status(DEEPGEMM_STATUS_INTERNAL_ERROR, "HOME is not set for JIT cache");
   }
-  return std::filesystem::path(home) / ".deep_gemm_rs";
+  return std::filesystem::path(home) / ".deepgemm_rs";
 }
 
 uint64_t fnv1a64(const std::string& input) {

@@ -4,6 +4,17 @@ version.workspace = true
 edition.workspace = true
 build = "build.rs"
 links = "deepgemm"
+include = [
+    "Cargo.toml",
+    "build.rs",
+    "src/**",
+    "csrc/**",
+    "vendor/DeepGEMM/LICENSE",
+    "vendor/DeepGEMM/deep_gemm/include/**",
+    "vendor/DeepGEMM/third-party/cutlass/include/**",
+    "vendor/DeepGEMM/third-party/cutlass/tools/util/include/**",
+    "vendor/DeepGEMM/third-party/fmt/include/**",
+]
 
 [dependencies]
 

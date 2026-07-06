@@ -98,13 +98,11 @@ fn add_cuda_include_candidates(candidates: &mut Vec<PathBuf>, root: PathBuf) {
 fn validate_deepgemm_root(path: PathBuf, source: &str) -> PathBuf {
     let root = path.canonicalize().unwrap_or_else(|error| {
         panic!(
-            "{source} does not point to a readable DeepGEMM checkout at {}: {error}",
+            "{source} does not point to a readable DeepGEMM source tree at {}: {error}",
             path.display()
         )
     });
 
-    require_path(&root, "CMakeLists.txt", source);
-    require_path(&root, "csrc/python_api.cpp", source);
     require_path(
         &root,
         "deep_gemm/include/deep_gemm/common/types.cuh",
@@ -112,12 +110,42 @@ fn validate_deepgemm_root(path: PathBuf, source: &str) -> PathBuf {
     );
     require_path(
         &root,
-        "deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh",
+        "deep_gemm/include/deep_gemm/impls/sm90_fp8_mqa_logits.cuh",
+        source,
+    );
+    require_path(
+        &root,
+        "deep_gemm/include/deep_gemm/impls/sm90_fp8_paged_mqa_logits.cuh",
+        source,
+    );
+    require_path(
+        &root,
+        "deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh",
+        source,
+    );
+    require_path(
+        &root,
+        "deep_gemm/include/deep_gemm/impls/smxx_clean_logits.cuh",
+        source,
+    );
+    require_path(
+        &root,
+        "deep_gemm/include/deep_gemm/scheduler/sm90_paged_mqa_logits.cuh",
+        source,
+    );
+    require_path(
+        &root,
+        "deep_gemm/include/deep_gemm/scheduler/sm100_paged_mqa_logits.cuh",
         source,
     );
     require_path(
         &root,
         "third-party/cutlass/include/cutlass/cutlass.h",
+        source,
+    );
+    require_path(
+        &root,
+        "third-party/cutlass/tools/util/include/cutlass/util/host_tensor.h",
         source,
     );
     require_path(&root, "third-party/fmt/include/fmt/core.h", source);
@@ -133,12 +161,12 @@ fn require_path(root: &Path, relative: &str, source: &str) {
 
     if relative.starts_with("third-party/") {
         panic!(
-            "{source} DeepGEMM checkout is missing {relative}. Initialize nested submodules with `git submodule update --init --recursive crates/deepgemm-sys/vendor/DeepGEMM`."
+            "{source} DeepGEMM source tree is missing {relative}. Initialize nested submodules with `git submodule update --init --recursive crates/deepgemm-sys/vendor/DeepGEMM`, or include the required runtime headers when packaging."
         );
     }
 
     panic!(
-        "{source} does not look like a DeepGEMM checkout: missing {}",
+        "{source} does not look like a DeepGEMM runtime source tree: missing {}",
         path.display()
     );
 }
