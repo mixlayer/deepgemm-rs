@@ -3,15 +3,73 @@
 #include "deepgemm_raw_runtime.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
+#include <iostream>
+#include <limits>
+#include <numeric>
 #include <sstream>
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 namespace deepgemm_rs {
 namespace {
 
 constexpr int kBlockK = 128;
 constexpr int kSmemCapacity = 232448;
+constexpr int kBlockMMultipleOf = 1;
+constexpr int kBlockNMultipleOf = 1;
+
+struct GemmLayout {
+  bool swap_ab = false;
+  int block_m = 1;
+  int block_n = 1;
+  int block_k = kBlockK;
+  int cluster_m = 1;
+  int cluster_n = 1;
+
+  int cluster_size() const {
+    return cluster_m * cluster_n;
+  }
+};
+
+struct StorageConfig {
+  int load_block_m = 1;
+  int load_block_n = 1;
+  int store_block_m = 1;
+  int store_block_n = 1;
+  int swizzle_a_mode = 0;
+  int swizzle_b_mode = 0;
+  int swizzle_cd_mode = 0;
+};
+
+struct PipelineConfig {
+  int smem_size = 0;
+  int num_stages = 0;
+};
+
+struct LaunchConfig {
+  int num_threads = 1;
+  int num_tma_threads = 0;
+  int num_math_threads = 0;
+  int num_non_epilogue_threads = 0;
+  int num_epilogue_threads = 0;
+};
+
+struct GemmConfig {
+  GemmLayout layout;
+  StorageConfig storage;
+  PipelineConfig pipeline;
+  LaunchConfig launch;
+};
+
+struct LayoutInfo {
+  int num_waves = 0;
+  int last_wave_util = 0;
+  double num_cycles = 0.0;
+  GemmLayout layout;
+};
 
 int64_t ceil_div_i64(int64_t value, int64_t divisor) {
   if (value < 0 || divisor <= 0) {
@@ -66,6 +124,74 @@ int64_t scale_k_divisor(int gran_k, deepgemm_dtype_t dtype) {
     throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "scale gran_k overflowed");
   }
   return static_cast<int64_t>(gran_k) * factor;
+}
+
+int ceil_div_int(int value, int divisor) {
+  return as_i32(ceil_div_i64(value, divisor), "ceil_div");
+}
+
+int align_int(int value, int alignment) {
+  return as_i32(align_i64(value, alignment), "alignment");
+}
+
+int get_swizzle_mode(int block_size, int elem_size) {
+  for (int mode : {128, 64, 32, 16}) {
+    if ((block_size * elem_size) % mode == 0) {
+      return mode;
+    }
+  }
+  throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "unsupported swizzle configuration");
+  return 0;
+}
+
+bool env_enabled(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' && std::atoi(value) != 0;
+}
+
+void print_gemm_config_once(
+    const char* arch,
+    int m,
+    int n,
+    int k,
+    int num_sms,
+    const GemmConfig& config,
+    const LayoutInfo& info) {
+  if (!env_enabled("DG_JIT_DEBUG") && !env_enabled("DG_PRINT_CONFIGS")) {
+    return;
+  }
+
+  std::ostringstream key;
+  key << arch << ':' << m << 'x' << n << 'x' << k << ':' << num_sms;
+  static std::unordered_set<std::string> printed;
+  if (!printed.insert(key.str()).second) {
+    return;
+  }
+
+  std::cout
+      << "DeepGEMM raw " << arch << " fp8_gemm_nt"
+      << "(m=" << m << ", n=" << n << ", k=" << k << ", num_sms=" << num_sms << "): "
+      << "layout(swap_ab=" << config.layout.swap_ab
+      << ", block_m=" << config.layout.block_m
+      << ", block_n=" << config.layout.block_n
+      << ", block_k=" << config.layout.block_k
+      << ", cluster_m=" << config.layout.cluster_m
+      << ", cluster_n=" << config.layout.cluster_n << "), "
+      << "storage(load_m=" << config.storage.load_block_m
+      << ", load_n=" << config.storage.load_block_n
+      << ", store_m=" << config.storage.store_block_m
+      << ", store_n=" << config.storage.store_block_n
+      << ", swizzle_a=" << config.storage.swizzle_a_mode
+      << ", swizzle_b=" << config.storage.swizzle_b_mode
+      << ", swizzle_cd=" << config.storage.swizzle_cd_mode << "), "
+      << "pipeline(stages=" << config.pipeline.num_stages
+      << ", smem=" << config.pipeline.smem_size << "), "
+      << "launch(threads=" << config.launch.num_threads
+      << ", cluster=" << config.layout.cluster_size() << "), "
+      << "layout_info(waves=" << info.num_waves
+      << ", last_wave_util=" << info.last_wave_util
+      << ", cycles=" << info.num_cycles << ")"
+      << std::endl;
 }
 
 void require_tensor_rank(
@@ -227,16 +353,345 @@ std::string transpose_and_pack_fp32_code(int num_threads, int block_mn, int sf_k
   return code.str();
 }
 
+StorageConfig sm90_storage_config(const GemmLayout& layout) {
+  StorageConfig storage;
+  storage.load_block_m = layout.block_m;
+  storage.load_block_n = layout.block_n;
+  storage.store_block_m = layout.block_m;
+  storage.store_block_n = layout.block_n;
+  storage.swizzle_a_mode = get_swizzle_mode(layout.block_k, 1);
+  storage.swizzle_b_mode = get_swizzle_mode(layout.block_k, 1);
+  storage.swizzle_cd_mode = get_swizzle_mode(storage.store_block_n, 2);
+  return storage;
+}
+
+PipelineConfig sm90_pipeline_config(int k, const GemmLayout& layout, const StorageConfig& storage) {
+  constexpr int kNumMaxStages = 16;
+  const int smem_cd = align_int(layout.block_m * layout.block_n * 2, 1024);
+  const int smem_barriers = kNumMaxStages * 8 * 2;
+  const int smem_a_per_stage = storage.load_block_m * layout.block_k;
+  const int smem_b_per_stage = storage.load_block_n * layout.block_k;
+  const int smem_sfa_per_stage = align_int(layout.block_m * 4, 128);
+  const int use_uniform_sfb = layout.block_k % layout.block_n == 0 ? 1 : 2;
+  const int smem_extra_sfb = align_int(ceil_div_int(k, layout.block_k) * 4 * use_uniform_sfb, 8);
+  const int smem_extra = smem_cd + smem_barriers + smem_extra_sfb;
+  const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage;
+  const int num_stages = std::min((kSmemCapacity - smem_extra) / smem_per_stage, kNumMaxStages);
+  return {smem_extra + num_stages * smem_per_stage, num_stages};
+}
+
+LaunchConfig sm90_launch_config(const GemmLayout& layout) {
+  LaunchConfig launch;
+  launch.num_tma_threads = 128;
+  launch.num_math_threads = layout.block_m <= 64 ? 128 : 256;
+  launch.num_threads = launch.num_tma_threads + launch.num_math_threads;
+  return launch;
+}
+
+LayoutInfo sm90_layout_info(int m, int n, int k, int num_sms, const GemmLayout& layout) {
+  const int64_t num_blocks =
+      static_cast<int64_t>(ceil_div_int(m, layout.block_m)) *
+      static_cast<int64_t>(ceil_div_int(n, layout.block_n));
+  const int num_waves = as_i32(ceil_div_i64(num_blocks, num_sms), "SM90 waves");
+  const int num_last_blocks = static_cast<int>(num_blocks % num_sms);
+  const int last_wave_util = num_last_blocks == 0 ? num_sms : num_last_blocks;
+
+  const double l2_bandwidth_per_cycle = std::min(64.0 * num_sms, 8e6 / 1.3e3);
+  const double l1_bandwidth_per_cycle = 128.0 * num_sms;
+  constexpr int wgmma_m = 64;
+  constexpr int elem_size_ab = 1;
+  constexpr int elem_size_cd = 2;
+
+  const int64_t num_bytes_l2_ab =
+      static_cast<int64_t>(k) *
+      (layout.block_m / layout.cluster_n + layout.block_n / layout.cluster_m) *
+      elem_size_ab;
+  const int64_t num_bytes_l1_ab =
+      static_cast<int64_t>(k) * (layout.block_m + layout.block_n) * elem_size_ab;
+  const int64_t num_bytes_l1_tc =
+      static_cast<int64_t>(k) * (std::max(wgmma_m, layout.block_m) + layout.block_n) * elem_size_ab +
+      static_cast<int64_t>(layout.block_m) * layout.block_n * elem_size_cd;
+  const int64_t num_bytes_l1_l2_cd =
+      static_cast<int64_t>(layout.block_m) * layout.block_n * elem_size_cd;
+  const double num_l2_cycles =
+      (num_bytes_l2_ab + num_bytes_l1_l2_cd) * static_cast<double>(num_blocks) /
+      l2_bandwidth_per_cycle;
+  const double num_l1_cycles =
+      (num_bytes_l1_ab + num_bytes_l1_tc + num_bytes_l1_l2_cd) *
+      static_cast<double>(num_blocks) /
+      l1_bandwidth_per_cycle;
+  const double wave_efficiency = static_cast<double>(num_blocks) / (num_waves * num_sms);
+  double num_cycles = std::max(num_l1_cycles, num_l2_cycles) / wave_efficiency;
+  if (layout.cluster_size() > 1 && num_waves <= 1) {
+    num_cycles = std::numeric_limits<double>::infinity();
+  }
+  return {num_waves, last_wave_util, num_cycles, layout};
+}
+
+std::vector<GemmLayout> sm90_layout_candidates(int m, int, int k, int num_sms) {
+  std::vector<int> block_m_candidates = {64, 128};
+  if (m <= 16) {
+    block_m_candidates.push_back(16);
+  }
+  if (m <= 32) {
+    block_m_candidates.push_back(32);
+  }
+  block_m_candidates.push_back(256);
+
+  std::vector<int> block_n_candidates;
+  const int step = std::lcm(16, kBlockNMultipleOf);
+  for (int block_n = step; block_n <= 192; block_n += step) {
+    block_n_candidates.push_back(block_n);
+  }
+
+  std::vector<GemmLayout> candidates;
+  for (int cluster_m = 1; cluster_m <= 2; ++cluster_m) {
+    for (int cluster_n = 1; cluster_n <= 2; ++cluster_n) {
+      if (cluster_m * cluster_n > 2) {
+        continue;
+      }
+      if (num_sms % (cluster_m * cluster_n) != 0) {
+        continue;
+      }
+      for (int block_m : block_m_candidates) {
+        for (int block_n : block_n_candidates) {
+          if (block_n > kBlockK &&
+              (block_n % (block_n - kBlockK) != 0 && kBlockK % (block_n - kBlockK) != 0)) {
+            continue;
+          }
+          if (block_m > 128 && block_n > 128) {
+            continue;
+          }
+          GemmLayout layout{false, block_m, block_n, kBlockK, cluster_m, cluster_n};
+          const auto storage = sm90_storage_config(layout);
+          if (storage.swizzle_a_mode % 64 != 0 || storage.swizzle_b_mode % 64 != 0) {
+            continue;
+          }
+          const auto pipeline = sm90_pipeline_config(k, layout, storage);
+          if (pipeline.num_stages < 3 ||
+              (block_m * block_n < 128 * 192 && pipeline.num_stages < 4)) {
+            continue;
+          }
+          candidates.push_back(layout);
+        }
+      }
+    }
+  }
+  return candidates;
+}
+
+GemmConfig sm90_best_config(int m, int n, int k, int num_sms, LayoutInfo* selected_info) {
+  const auto candidates = sm90_layout_candidates(m, n, k, num_sms);
+  if (candidates.empty()) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "no SM90 FP8 GEMM heuristic candidates");
+  }
+
+  GemmLayout best_layout = candidates.front();
+  LayoutInfo best_info = sm90_layout_info(m, n, k, num_sms, best_layout);
+  for (size_t i = 1; i < candidates.size(); ++i) {
+    const auto info = sm90_layout_info(m, n, k, num_sms, candidates[i]);
+    if (info.num_cycles < best_info.num_cycles) {
+      best_layout = candidates[i];
+      best_info = info;
+    }
+  }
+
+  GemmConfig config;
+  config.layout = best_layout;
+  config.storage = sm90_storage_config(best_layout);
+  config.pipeline = sm90_pipeline_config(k, best_layout, config.storage);
+  config.launch = sm90_launch_config(best_layout);
+  *selected_info = best_info;
+  return config;
+}
+
+std::pair<int, int> sm100_sf_aligned_blocks(int block_m, int block_n) {
+  return {align_int(block_m, 128), align_int(block_n, 128)};
+}
+
+StorageConfig sm100_storage_config(const GemmLayout& layout) {
+  StorageConfig storage;
+  storage.load_block_m = layout.block_m / layout.cluster_n;
+  storage.load_block_n = layout.block_n / layout.cluster_m;
+  storage.store_block_m = layout.swap_ab ? 16 : std::min(128, layout.block_m);
+  storage.store_block_n = layout.block_n;
+  storage.swizzle_a_mode = get_swizzle_mode(layout.block_k, 1);
+  storage.swizzle_b_mode = get_swizzle_mode(layout.block_k, 1);
+  storage.swizzle_cd_mode = get_swizzle_mode(storage.store_block_n, 2);
+  return storage;
+}
+
+PipelineConfig sm100_pipeline_config(const GemmLayout& layout, const StorageConfig& storage) {
+  constexpr int kNumMaxStages = 32;
+  const int smem_cd = layout.swap_ab
+      ? storage.store_block_m * storage.store_block_n * 2 * 2
+      : storage.store_block_m * storage.swizzle_cd_mode * 2;
+  const int smem_barriers = kNumMaxStages * 8 * 3 + 2 * 8 * 2 + 8;
+  const int smem_tmem_ptr = 4;
+  const int smem_a_per_stage = storage.load_block_m * layout.block_k;
+  const int smem_b_per_stage = storage.load_block_n * layout.block_k;
+  const auto [sf_block_m, sf_block_n] =
+      sm100_sf_aligned_blocks(layout.block_m, layout.block_n);
+  const int smem_sfa_per_stage = sf_block_m * 4;
+  const int smem_sfb_per_stage = sf_block_n * 4;
+  const int smem_extra = smem_cd + smem_barriers + smem_tmem_ptr;
+  const int smem_per_stage =
+      smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage;
+  const int num_stages = std::min((kSmemCapacity - smem_extra) / smem_per_stage, kNumMaxStages);
+  return {smem_extra + num_stages * smem_per_stage, num_stages};
+}
+
+LaunchConfig sm100_launch_config() {
+  LaunchConfig launch;
+  launch.num_threads = 256;
+  launch.num_tma_threads = 32;
+  launch.num_math_threads = 128;
+  launch.num_non_epilogue_threads = 128;
+  launch.num_epilogue_threads = 128;
+  return launch;
+}
+
+LayoutInfo sm100_layout_info(int m, int n, int num_sms, const GemmLayout& layout) {
+  const int64_t num_blocks =
+      static_cast<int64_t>(ceil_div_int(m, layout.block_m)) *
+      static_cast<int64_t>(ceil_div_int(n, layout.block_n));
+  const int num_waves = as_i32(ceil_div_i64(num_blocks, num_sms), "SM100 waves");
+  const int num_last_blocks = static_cast<int>(num_blocks % num_sms);
+  const int last_wave_util = num_last_blocks == 0 ? num_sms : num_last_blocks;
+  return {num_waves, last_wave_util, 0.0, layout};
+}
+
+bool sm100_layout_is_better(const LayoutInfo& a, const LayoutInfo& b) {
+  if ((a.num_waves == 1 || b.num_waves == 1) && a.num_waves != b.num_waves) {
+    return a.num_waves < b.num_waves;
+  }
+  if (a.layout.cluster_size() != b.layout.cluster_size()) {
+    return a.layout.cluster_size() > b.layout.cluster_size();
+  }
+  if (a.num_waves != b.num_waves) {
+    return a.num_waves < b.num_waves;
+  }
+  if (a.last_wave_util != b.last_wave_util) {
+    return a.last_wave_util > b.last_wave_util;
+  }
+  const int a_extent = a.layout.block_m + a.layout.block_n;
+  const int b_extent = b.layout.block_m + b.layout.block_n;
+  if (a_extent != b_extent) {
+    return a_extent < b_extent;
+  }
+  return a.layout.block_m * a.layout.block_n < b.layout.block_m * b.layout.block_n;
+}
+
+std::vector<GemmLayout> sm100_layout_candidates(int m, int n, int k, int num_sms) {
+  std::vector<GemmLayout> candidates;
+  for (int swap_ab = 0; swap_ab < 2; ++swap_ab) {
+    std::vector<int> block_m_candidates;
+    std::vector<int> block_n_candidates;
+    if (swap_ab != 0) {
+      const int step = std::lcm(16, kBlockMMultipleOf);
+      for (int block_m = step; block_m <= 256; block_m += step) {
+        block_m_candidates.push_back(block_m);
+      }
+      block_n_candidates = {128};
+    } else {
+      if (m <= 32) {
+        block_m_candidates = {32};
+      } else if (m <= 64) {
+        block_m_candidates = {64};
+      } else {
+        block_m_candidates = {128};
+      }
+      if (16 % kBlockNMultipleOf == 0) {
+        block_n_candidates.push_back(16);
+      }
+      const int step = std::lcm(32, kBlockNMultipleOf);
+      const int end = k <= 256 ? 128 : 256;
+      for (int block_n = step; block_n <= end; block_n += step) {
+        block_n_candidates.push_back(block_n);
+      }
+    }
+
+    for (int cluster_m = 1; cluster_m <= 2; ++cluster_m) {
+      if (swap_ab != 0 && cluster_m > 1) {
+        continue;
+      }
+      for (int cluster_n = 1; cluster_n <= 2; ++cluster_n) {
+        if (cluster_m * cluster_n > 2) {
+          continue;
+        }
+        if (swap_ab == 0 && cluster_n > 1) {
+          continue;
+        }
+        if (num_sms % (cluster_m * cluster_n) != 0) {
+          continue;
+        }
+        for (int block_m : block_m_candidates) {
+          if ((block_m / cluster_n) % 8 != 0) {
+            continue;
+          }
+          if (ceil_div_int(m, block_m) % cluster_m != 0) {
+            continue;
+          }
+          for (int block_n : block_n_candidates) {
+            if ((block_n / cluster_m) % 8 != 0) {
+              continue;
+            }
+            if (ceil_div_int(n, block_n) % cluster_n != 0) {
+              continue;
+            }
+            if (swap_ab != 0 && block_n != 128) {
+              continue;
+            }
+            const auto [sf_block_m, sf_block_n] = sm100_sf_aligned_blocks(block_m, block_n);
+            const int tmem_sf_cols = sf_block_m / 32 + sf_block_n / 32;
+            const int umma_n = swap_ab != 0 ? block_m : block_n;
+            if (2 * umma_n + tmem_sf_cols > 512) {
+              continue;
+            }
+            GemmLayout layout{swap_ab != 0, block_m, block_n, kBlockK, cluster_m, cluster_n};
+            const auto storage = sm100_storage_config(layout);
+            if (storage.swizzle_a_mode != 128 || storage.swizzle_b_mode != 128) {
+              continue;
+            }
+            candidates.push_back(layout);
+          }
+        }
+      }
+    }
+  }
+  return candidates;
+}
+
+GemmConfig sm100_best_config(int m, int n, int k, int num_sms, LayoutInfo* selected_info) {
+  const auto candidates = sm100_layout_candidates(m, n, k, num_sms);
+  if (candidates.empty()) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "no SM100 FP8 GEMM heuristic candidates");
+  }
+
+  GemmLayout best_layout = candidates.front();
+  LayoutInfo best_info = sm100_layout_info(m, n, num_sms, best_layout);
+  for (size_t i = 1; i < candidates.size(); ++i) {
+    const auto info = sm100_layout_info(m, n, num_sms, candidates[i]);
+    if (sm100_layout_is_better(info, best_info)) {
+      best_layout = candidates[i];
+      best_info = info;
+    }
+  }
+
+  GemmConfig config;
+  config.layout = best_layout;
+  config.storage = sm100_storage_config(best_layout);
+  config.pipeline = sm100_pipeline_config(best_layout, config.storage);
+  config.launch = sm100_launch_config();
+  *selected_info = best_info;
+  return config;
+}
+
 std::string sm90_fp8_gemm_1d2d_code(
     int m,
     int n,
     int k,
-    int block_m,
-    int block_n,
-    int block_k,
-    int num_stages,
-    int num_tma_threads,
-    int num_math_threads,
+    const GemmConfig& config,
     int num_sms) {
   std::ostringstream code;
   code
@@ -247,11 +702,13 @@ std::string sm90_fp8_gemm_1d2d_code(
       << "        cute::UMMA::Major::K,\n"
       << "        0, " << n << ", " << k << ",\n"
       << "        1,\n"
-      << "        " << block_m << ", " << block_n << ", " << block_k << ",\n"
-      << "        128, 128, 128,\n"
-      << "        " << num_stages << ",\n"
-      << "        " << num_tma_threads << ", " << num_math_threads << ",\n"
-      << "        1, false,\n"
+      << "        " << config.layout.block_m << ", " << config.layout.block_n << ", " << config.layout.block_k << ",\n"
+      << "        " << config.storage.swizzle_a_mode << ", "
+      << config.storage.swizzle_b_mode << ", " << config.storage.swizzle_cd_mode << ",\n"
+      << "        " << config.pipeline.num_stages << ",\n"
+      << "        " << config.launch.num_tma_threads << ", " << config.launch.num_math_threads << ",\n"
+      << "        " << config.layout.cluster_size() << ", "
+      << (config.layout.cluster_n > 1 ? "true" : "false") << ",\n"
       << "        " << num_sms << ", GemmType::Normal,\n"
       << "        cutlass::bfloat16_t,\n"
       << "        epilogue::transform::EpilogueIdentity\n"
@@ -265,14 +722,9 @@ std::string sm100_fp8_gemm_1d1d_code(
     int m,
     int n,
     int k,
-    int block_m,
-    int block_n,
-    int block_k,
     int gran_k_a,
     int gran_k_b,
-    int num_stages,
-    int num_non_epilogue_threads,
-    int num_epilogue_threads,
+    const GemmConfig& config,
     int num_sms) {
   std::ostringstream code;
   code
@@ -283,14 +735,17 @@ std::string sm100_fp8_gemm_1d1d_code(
       << "        cute::UMMA::Major::K, cute::UMMA::Major::K,\n"
       << "        " << gran_k_a << ", " << gran_k_b << ", " << gran_k_a << ",\n"
       << "        0, " << n << ", " << k << ",\n"
-      << "        " << block_m << ", " << block_n << ", " << block_k << ",\n"
+      << "        " << config.layout.block_m << ", " << config.layout.block_n << ", " << config.layout.block_k << ",\n"
       << "        1,\n"
-      << "        128, 128, 128,\n"
-      << "        " << num_stages << ",\n"
-      << "        " << num_non_epilogue_threads << ", " << num_epilogue_threads << ",\n"
-      << "        1, false,\n"
+      << "        " << config.storage.swizzle_a_mode << ", "
+      << config.storage.swizzle_b_mode << ", " << config.storage.swizzle_cd_mode << ",\n"
+      << "        " << config.pipeline.num_stages << ",\n"
+      << "        " << config.launch.num_non_epilogue_threads << ", "
+      << config.launch.num_epilogue_threads << ",\n"
+      << "        " << config.layout.cluster_size() << ", "
+      << (config.layout.cluster_n > 1 ? "true" : "false") << ",\n"
       << "        " << num_sms << ",\n"
-      << "        false, true,\n"
+      << "        " << (config.layout.swap_ab ? "true" : "false") << ", true,\n"
       << "        GemmType::Normal, false,\n"
       << "        cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::bfloat16_t,\n"
       << "        epilogue::transform::EpilogueIdentity\n"
@@ -298,83 +753,6 @@ std::string sm100_fp8_gemm_1d1d_code(
       << "};\n";
   (void)m;
   return code.str();
-}
-
-int sm90_smem_sfb_size(int k, int block_n, int block_k) {
-  const bool use_uniform_sfb = block_k % block_n == 0;
-  return as_i32(
-      align_i64(ceil_div_i64(k, block_k) * (use_uniform_sfb ? 1 : 2) * 4, 8),
-      "SM90 smem_sfb");
-}
-
-int sm90_num_stages(int k, int block_m, int block_n, int block_k) {
-  constexpr int kNumMaxStages = 16;
-  const int smem_d = as_i32(align_i64(block_m * block_n * 2, 1024), "SM90 smem_d");
-  const int smem_a_per_stage = block_m * block_k;
-  const int smem_b_per_stage = block_n * block_k;
-  const int smem_sfa_per_stage = as_i32(align_i64(block_m * 4, 128), "SM90 smem_sfa");
-  const int smem_extra = smem_d + sm90_smem_sfb_size(k, block_n, block_k) + kNumMaxStages * 8 * 2;
-  const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage;
-  return std::min((kSmemCapacity - smem_extra) / smem_per_stage, kNumMaxStages);
-}
-
-int sm90_smem_size(int k, int block_m, int block_n, int block_k, int num_stages) {
-  const int smem_d = as_i32(align_i64(block_m * block_n * 2, 1024), "SM90 smem_d");
-  const int smem_a_per_stage = block_m * block_k;
-  const int smem_b_per_stage = block_n * block_k;
-  const int smem_sfa_per_stage = as_i32(align_i64(block_m * 4, 128), "SM90 smem_sfa");
-  const int smem_sfb = sm90_smem_sfb_size(k, block_n, block_k);
-  const int smem_barriers = num_stages * 8 * 2;
-  return smem_d +
-      num_stages * (smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage) +
-      smem_sfb +
-      smem_barriers;
-}
-
-int sm100_smem_size(
-    int block_m,
-    int block_n,
-    int block_k,
-    int num_stages,
-    int elem_a,
-    int elem_b,
-    int elem_cd) {
-  constexpr int kNumEpilogueStages = 2;
-  constexpr int kNumTmaStoreStages = 2;
-  const int store_block_m = std::min(block_m, 128);
-  const int store_block_n = 128 / elem_cd;
-  const int sf_block_m = as_i32(align_i64(block_m, 128), "SM100 sf_block_m");
-  const int sf_block_n = as_i32(align_i64(block_n, 128), "SM100 sf_block_n");
-  const int smem_cd = store_block_m * store_block_n * elem_cd * kNumTmaStoreStages;
-  const int smem_a_per_stage = block_m * block_k * elem_a;
-  const int smem_b_per_stage = block_n * block_k * elem_b;
-  const int smem_sfa_per_stage = sf_block_m * 4;
-  const int smem_sfb_per_stage = sf_block_n * 4;
-  const int smem_barriers = (num_stages * 3 + kNumEpilogueStages * 2) * 8;
-  const int smem_tmem_ptr = 4;
-  return smem_cd +
-      num_stages * (smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage) +
-      smem_barriers +
-      smem_tmem_ptr;
-}
-
-int sm100_num_stages(int block_m, int block_n, int block_k, int elem_a, int elem_b, int elem_cd) {
-  constexpr int kNumMaxStages = 32;
-  constexpr int kNumTmaStoreStages = 2;
-  const int store_block_m = std::min(block_m, 128);
-  const int store_block_n = 128 / elem_cd;
-  const int sf_block_m = as_i32(align_i64(block_m, 128), "SM100 sf_block_m");
-  const int sf_block_n = as_i32(align_i64(block_n, 128), "SM100 sf_block_n");
-  const int smem_cd = store_block_m * store_block_n * elem_cd * kNumTmaStoreStages;
-  const int smem_barriers = kNumMaxStages * 8 * 3 + 2 * 8 * 2 + 8;
-  const int smem_tmem_ptr = 4;
-  const int smem_extra = smem_cd + smem_barriers + smem_tmem_ptr;
-  const int smem_per_stage =
-      block_m * block_k * elem_a +
-      block_n * block_k * elem_b +
-      sf_block_m * 4 +
-      sf_block_n * 4;
-  return std::min((kSmemCapacity - smem_extra) / smem_per_stage, kNumMaxStages);
 }
 
 void validate_common_gemm_nt(
@@ -408,53 +786,51 @@ void launch_sm90_fp8_gemm_nt(
     int n,
     int k,
     int num_sms) {
-  constexpr int block_m = 64;
-  constexpr int block_n = 128;
-  constexpr int block_k = kBlockK;
-  constexpr int num_tma_threads = 128;
-  constexpr int num_math_threads = 128;
-  const int num_stages = sm90_num_stages(k, block_m, block_n, block_k);
-  if (num_stages <= 0) {
-    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 GEMM config exceeds shared memory capacity");
-  }
+  LayoutInfo layout_info;
+  const auto config = sm90_best_config(m, n, k, num_sms, &layout_info);
+  print_gemm_config_once("SM90", m, n, k, num_sms, config, layout_info);
 
-  require_mn_major_scale(params.a_scale, m, k, block_k, DEEPGEMM_DTYPE_F32, "a_scale");
+  require_mn_major_scale(params.a_scale, m, k, config.layout.block_k, DEEPGEMM_DTYPE_F32, "a_scale");
   require_contiguous_2d(params.b_scale, DEEPGEMM_DTYPE_F32, "b_scale");
-  require_shape_2d(params.b_scale, ceil_div_i64(n, block_k), ceil_div_i64(k, block_k), "b_scale");
+  require_shape_2d(
+      params.b_scale,
+      ceil_div_i64(n, config.layout.block_k),
+      ceil_div_i64(k, config.layout.block_k),
+      "b_scale");
 
   const auto tensor_map_a = make_tma_2d_desc(
       params.a.data,
       params.a.dtype,
       k,
       m,
-      block_k,
-      block_m,
+      config.layout.block_k,
+      config.storage.load_block_m,
       as_i32(params.a.stride[0], "a stride(0)"),
-      128);
+      config.storage.swizzle_a_mode);
   const auto tensor_map_b = make_tma_2d_desc(
       params.b.data,
       params.b.dtype,
       k,
       n,
-      block_k,
-      block_n,
+      config.layout.block_k,
+      config.storage.load_block_n,
       as_i32(params.b.stride[0], "b stride(0)"),
-      128);
+      config.storage.swizzle_b_mode);
   const auto tensor_map_d = make_tma_2d_desc(
       params.d.data,
       params.d.dtype,
       n,
       m,
-      block_n,
-      block_m,
+      config.storage.store_block_n,
+      config.storage.store_block_m,
       as_i32(params.d.stride[0], "d stride(0)"),
-      128);
+      config.storage.swizzle_cd_mode);
   const auto tensor_map_sfa = make_tma_2d_desc(
       params.a_scale.data,
       params.a_scale.dtype,
       tma_aligned_mn(m, params.a_scale.dtype, "a_scale aligned m"),
-      as_i32(ceil_div_i64(k, block_k), "a_scale k blocks"),
-      block_m,
+      as_i32(ceil_div_i64(k, config.layout.block_k), "a_scale k blocks"),
+      config.layout.block_m,
       1,
       tma_aligned_mn(m, params.a_scale.dtype, "a_scale stride"),
       0);
@@ -465,18 +841,14 @@ void launch_sm90_fp8_gemm_nt(
           m,
           n,
           k,
-          block_m,
-          block_n,
-          block_k,
-          num_stages,
-          num_tma_threads,
-          num_math_threads,
+          config,
           num_sms));
 
   LaunchArgs launch_args;
   launch_args.grid_x = num_sms;
-  launch_args.num_threads = num_tma_threads + num_math_threads;
-  launch_args.smem_size = sm90_smem_size(k, block_m, block_n, block_k, num_stages);
+  launch_args.num_threads = config.launch.num_threads;
+  launch_args.smem_size = config.pipeline.smem_size;
+  launch_args.cluster_dim = config.layout.cluster_size();
   launch_args.enable_pdl = pdl_enabled();
 
   auto* sfb = const_cast<float*>(reinterpret_cast<const float*>(params.b_scale.data));
@@ -506,46 +878,39 @@ void launch_sm100_fp8_gemm_nt(
     int n,
     int k,
     int num_sms) {
-  constexpr int block_m = 128;
-  constexpr int block_n = 128;
-  constexpr int block_k = kBlockK;
   constexpr int gran_k_a = 128;
   constexpr int gran_k_b = 128;
-  constexpr int num_non_epilogue_threads = 128;
-  constexpr int num_epilogue_threads = 128;
+  LayoutInfo layout_info;
+  const auto config = sm100_best_config(m, n, k, num_sms, &layout_info);
+  print_gemm_config_once("SM100", m, n, k, num_sms, config, layout_info);
 
   require_mn_major_scale(params.a_scale, m, k, gran_k_a, DEEPGEMM_DTYPE_PACKED_UE8M0, "a_scale");
   require_mn_major_scale(params.b_scale, n, k, gran_k_b, DEEPGEMM_DTYPE_PACKED_UE8M0, "b_scale");
-
-  const int num_stages = sm100_num_stages(block_m, block_n, block_k, 1, 1, 2);
-  if (num_stages <= 0) {
-    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM100 GEMM config exceeds shared memory capacity");
-  }
 
   const auto tensor_map_a = make_tma_2d_desc(
       params.a.data,
       params.a.dtype,
       k,
       m,
-      block_k,
-      block_m,
+      config.layout.block_k,
+      config.storage.load_block_m,
       as_i32(params.a.stride[0], "a stride(0)"),
-      128);
+      config.storage.swizzle_a_mode);
   const auto tensor_map_b = make_tma_2d_desc(
       params.b.data,
       params.b.dtype,
       k,
       n,
-      block_k,
-      block_n,
+      config.layout.block_k,
+      config.storage.load_block_n,
       as_i32(params.b.stride[0], "b stride(0)"),
-      128);
+      config.storage.swizzle_b_mode);
   const auto tensor_map_sfa = make_tma_2d_desc(
       params.a_scale.data,
       params.a_scale.dtype,
       tma_aligned_mn(m, params.a_scale.dtype, "a_scale aligned m"),
       as_i32(ceil_div_i64(k, gran_k_a * 4), "a_scale packed k blocks"),
-      block_m,
+      config.layout.block_m,
       1,
       tma_aligned_mn(m, params.a_scale.dtype, "a_scale stride"),
       0);
@@ -554,7 +919,7 @@ void launch_sm100_fp8_gemm_nt(
       params.b_scale.dtype,
       tma_aligned_mn(n, params.b_scale.dtype, "b_scale aligned n"),
       as_i32(ceil_div_i64(k, gran_k_b * 4), "b_scale packed k blocks"),
-      block_n,
+      config.layout.block_n,
       1,
       tma_aligned_mn(n, params.b_scale.dtype, "b_scale stride"),
       0);
@@ -563,10 +928,10 @@ void launch_sm100_fp8_gemm_nt(
       params.d.dtype,
       n,
       m,
-      block_n,
-      block_m,
+      config.storage.store_block_n,
+      config.storage.store_block_m,
       as_i32(params.d.stride[0], "d stride(0)"),
-      128);
+      config.storage.swizzle_cd_mode);
 
   const auto runtime = build_kernel(
       "sm100_fp8_gemm_1d1d",
@@ -574,20 +939,16 @@ void launch_sm100_fp8_gemm_nt(
           m,
           n,
           k,
-          block_m,
-          block_n,
-          block_k,
           gran_k_a,
           gran_k_b,
-          num_stages,
-          num_non_epilogue_threads,
-          num_epilogue_threads,
+          config,
           num_sms));
 
   LaunchArgs launch_args;
   launch_args.grid_x = num_sms;
-  launch_args.num_threads = num_non_epilogue_threads + num_epilogue_threads;
-  launch_args.smem_size = sm100_smem_size(block_m, block_n, block_k, num_stages, 1, 1, 2);
+  launch_args.num_threads = config.launch.num_threads;
+  launch_args.smem_size = config.pipeline.smem_size;
+  launch_args.cluster_dim = config.layout.cluster_size();
   launch_args.enable_pdl = pdl_enabled();
 
   int* grouped_layout = nullptr;
