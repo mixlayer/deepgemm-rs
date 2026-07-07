@@ -7,6 +7,8 @@ pub mod arch;
 pub mod dtype;
 /// Error types returned by the safe wrapper layer.
 pub mod error;
+/// Dense FP8 GEMM shape validation, scale transforms, and launches.
+pub mod gemm;
 /// MQA logits shape validation and layout helpers.
 pub mod mqa;
 /// Runtime initialization helpers.
@@ -19,6 +21,10 @@ pub mod tensor;
 pub use arch::Arch;
 pub use dtype::DType;
 pub use error::{Error, Result};
+pub use gemm::{
+    Fp8GemmNtLaunch, Fp8GemmNtSpec, Fp8GemmScaleTransformLaunch, Fp8GemmScaleTransformSpec,
+    fp8_gemm_nt, fp8_gemm_nt_output_layout, fp8_gemm_scale_layout, fp8_gemm_transform_scale,
+};
 pub use mqa::{
     MqaLogitsLaunch, MqaLogitsSpec, PagedMqaLogitsLaunch, PagedMqaLogitsMetadataLaunch,
     PagedMqaLogitsMetadataSpec, PagedMqaLogitsSpec, fp8_fp4_mqa_logits, fp8_fp4_paged_mqa_logits,

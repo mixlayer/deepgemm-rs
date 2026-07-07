@@ -19,6 +19,8 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc/deepgemm_raw_runtime.cc");
     println!("cargo:rerun-if-changed=csrc/deepgemm_raw_mqa.h");
     println!("cargo:rerun-if-changed=csrc/deepgemm_raw_mqa.cc");
+    println!("cargo:rerun-if-changed=csrc/deepgemm_raw_gemm.h");
+    println!("cargo:rerun-if-changed=csrc/deepgemm_raw_gemm.cc");
     println!(
         "cargo:rerun-if-changed={}",
         deepgemm_root.join("deep_gemm").join("include").display()
@@ -44,6 +46,7 @@ fn main() {
         .file(manifest_dir.join("csrc").join("deepgemm_c_api.cc"))
         .file(manifest_dir.join("csrc").join("deepgemm_raw_runtime.cc"))
         .file(manifest_dir.join("csrc").join("deepgemm_raw_mqa.cc"))
+        .file(manifest_dir.join("csrc").join("deepgemm_raw_gemm.cc"))
         .compile("deepgemm_c_api");
 }
 
@@ -106,6 +109,21 @@ fn validate_deepgemm_root(path: PathBuf, source: &str) -> PathBuf {
     require_path(
         &root,
         "deep_gemm/include/deep_gemm/common/types.cuh",
+        source,
+    );
+    require_path(
+        &root,
+        "deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh",
+        source,
+    );
+    require_path(
+        &root,
+        "deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh",
+        source,
+    );
+    require_path(
+        &root,
+        "deep_gemm/include/deep_gemm/impls/smxx_layout.cuh",
         source,
     );
     require_path(

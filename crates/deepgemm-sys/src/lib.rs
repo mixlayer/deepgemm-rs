@@ -104,6 +104,23 @@ pub struct deepgemm_paged_mqa_logits_metadata_layout_params_t {
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct deepgemm_fp8_gemm_nt_output_layout_params_t {
+    pub m: i64,
+    pub n: i64,
+    pub output_dtype: deepgemm_dtype_t,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct deepgemm_fp8_gemm_scale_layout_params_t {
+    pub mn: i64,
+    pub k: i64,
+    pub gran_k: i64,
+    pub scale_dtype: deepgemm_dtype_t,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct deepgemm_mqa_logits_params_t {
     pub q: deepgemm_tensor_t,
     pub has_q_scale: bool,
@@ -151,6 +168,28 @@ pub struct deepgemm_paged_mqa_logits_params_t {
     pub stream: deepgemm_cuda_stream_t,
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct deepgemm_fp8_gemm_scale_transform_params_t {
+    pub scale: deepgemm_tensor_t,
+    pub transformed: deepgemm_tensor_mut_t,
+    pub mn: i64,
+    pub k: i64,
+    pub gran_k: i64,
+    pub stream: deepgemm_cuda_stream_t,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct deepgemm_fp8_gemm_nt_params_t {
+    pub a: deepgemm_tensor_t,
+    pub a_scale: deepgemm_tensor_t,
+    pub b: deepgemm_tensor_t,
+    pub b_scale: deepgemm_tensor_t,
+    pub d: deepgemm_tensor_mut_t,
+    pub stream: deepgemm_cuda_stream_t,
+}
+
 unsafe extern "C" {
     /// Returns the most recent error message recorded by the C ABI layer.
     pub fn deepgemm_last_error() -> *const c_char;
@@ -183,6 +222,16 @@ unsafe extern "C" {
         out: *mut deepgemm_tensor_layout_2d_t,
     ) -> deepgemm_status_t;
 
+    pub fn deepgemm_fp8_gemm_nt_output_layout(
+        params: *const deepgemm_fp8_gemm_nt_output_layout_params_t,
+        out: *mut deepgemm_tensor_layout_2d_t,
+    ) -> deepgemm_status_t;
+
+    pub fn deepgemm_fp8_gemm_scale_layout(
+        params: *const deepgemm_fp8_gemm_scale_layout_params_t,
+        out: *mut deepgemm_tensor_layout_2d_t,
+    ) -> deepgemm_status_t;
+
     pub fn deepgemm_fp8_fp4_mqa_logits(
         params: *const deepgemm_mqa_logits_params_t,
     ) -> deepgemm_status_t;
@@ -194,4 +243,10 @@ unsafe extern "C" {
     pub fn deepgemm_fp8_fp4_paged_mqa_logits(
         params: *const deepgemm_paged_mqa_logits_params_t,
     ) -> deepgemm_status_t;
+
+    pub fn deepgemm_fp8_gemm_transform_scale(
+        params: *const deepgemm_fp8_gemm_scale_transform_params_t,
+    ) -> deepgemm_status_t;
+
+    pub fn deepgemm_fp8_gemm_nt(params: *const deepgemm_fp8_gemm_nt_params_t) -> deepgemm_status_t;
 }

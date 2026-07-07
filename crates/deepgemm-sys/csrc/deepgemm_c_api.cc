@@ -1,5 +1,6 @@
 #include "deepgemm_c_api.h"
 
+#include "deepgemm_raw_gemm.h"
 #include "deepgemm_raw_mqa.h"
 #include "deepgemm_raw_runtime.h"
 
@@ -78,6 +79,17 @@ bool align_i64(int64_t value, int64_t alignment, int64_t* out) {
   return true;
 }
 
+bool ceil_div_i64(int64_t value, int64_t divisor, int64_t* out) {
+  if (value < 0 || divisor <= 0) {
+    return false;
+  }
+  if (value > std::numeric_limits<int64_t>::max() - divisor + 1) {
+    return false;
+  }
+  *out = (value + divisor - 1) / divisor;
+  return true;
+}
+
 deepgemm_status_t fill_2d_layout(
     deepgemm_dtype_t dtype,
     int64_t logical_rows,
@@ -108,6 +120,42 @@ deepgemm_status_t fill_2d_layout(
   out->allocation_shape[1] = allocation_cols;
   out->stride[0] = allocation_cols;
   out->stride[1] = 1;
+  out->element_count = element_count;
+  return clear_error();
+}
+
+deepgemm_status_t fill_2d_layout_explicit(
+    deepgemm_dtype_t dtype,
+    int64_t logical_rows,
+    int64_t logical_cols,
+    int64_t allocation_rows,
+    int64_t allocation_cols,
+    int64_t stride_rows,
+    int64_t stride_cols,
+    deepgemm_tensor_layout_2d_t* out) {
+  if (out == nullptr) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "layout output must not be null");
+  }
+  if (logical_rows < 0 || logical_cols < 0 || allocation_rows < 0 || allocation_cols < 0 ||
+      stride_rows < 0 || stride_cols < 0) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "invalid 2D layout dimensions");
+  }
+
+  uint64_t element_count = 0;
+  if (!checked_mul_u64(
+          static_cast<uint64_t>(allocation_rows),
+          static_cast<uint64_t>(allocation_cols),
+          &element_count)) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "layout element count overflowed");
+  }
+
+  out->dtype = dtype;
+  out->logical_shape[0] = logical_rows;
+  out->logical_shape[1] = logical_cols;
+  out->allocation_shape[0] = allocation_rows;
+  out->allocation_shape[1] = allocation_cols;
+  out->stride[0] = stride_rows;
+  out->stride[1] = stride_cols;
   out->element_count = element_count;
   return clear_error();
 }
@@ -294,6 +342,67 @@ extern "C" deepgemm_status_t deepgemm_paged_mqa_logits_metadata_layout(
       out);
 }
 
+extern "C" deepgemm_status_t deepgemm_fp8_gemm_nt_output_layout(
+    const deepgemm_fp8_gemm_nt_output_layout_params_t* params,
+    deepgemm_tensor_layout_2d_t* out) {
+  if (params == nullptr) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "GEMM output layout params must not be null");
+  }
+  if (params->m <= 0 || params->n <= 0) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "m and n must be positive");
+  }
+  if (params->output_dtype != DEEPGEMM_DTYPE_BF16) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "FP8 GEMM output dtype must be bf16");
+  }
+  return fill_2d_layout(
+      params->output_dtype,
+      params->m,
+      params->n,
+      params->m,
+      params->n,
+      out);
+}
+
+extern "C" deepgemm_status_t deepgemm_fp8_gemm_scale_layout(
+    const deepgemm_fp8_gemm_scale_layout_params_t* params,
+    deepgemm_tensor_layout_2d_t* out) {
+  if (params == nullptr) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "GEMM scale layout params must not be null");
+  }
+  if (params->mn <= 0 || params->k <= 0 || params->gran_k <= 0) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "mn, k, and gran_k must be positive");
+  }
+  if (params->scale_dtype != DEEPGEMM_DTYPE_F32 &&
+      params->scale_dtype != DEEPGEMM_DTYPE_PACKED_UE8M0) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "scale dtype must be f32 or packed UE8M0");
+  }
+  const int64_t elem_size = dtype_size(params->scale_dtype);
+  if (elem_size <= 0 || 16 % elem_size != 0) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "scale dtype has invalid element size");
+  }
+
+  int64_t scale_cols = 0;
+  const int64_t packed_factor = params->scale_dtype == DEEPGEMM_DTYPE_F32 ? 1 : 4;
+  if (params->gran_k > std::numeric_limits<int64_t>::max() / packed_factor ||
+      !ceil_div_i64(params->k, params->gran_k * packed_factor, &scale_cols)) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "scale K dimension overflowed");
+  }
+  int64_t aligned_mn = 0;
+  if (!align_i64(params->mn, 16 / elem_size, &aligned_mn)) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "scale MN alignment overflowed");
+  }
+
+  return fill_2d_layout_explicit(
+      params->scale_dtype,
+      params->mn,
+      scale_cols,
+      scale_cols,
+      aligned_mn,
+      1,
+      aligned_mn,
+      out);
+}
+
 extern "C" deepgemm_status_t deepgemm_fp8_fp4_mqa_logits(
     const deepgemm_mqa_logits_params_t* params) {
   if (params == nullptr) {
@@ -321,5 +430,25 @@ extern "C" deepgemm_status_t deepgemm_fp8_fp4_paged_mqa_logits(
   }
   return ffi_call([&]() {
     deepgemm_rs::launch_fp8_fp4_paged_mqa_logits(*params);
+  });
+}
+
+extern "C" deepgemm_status_t deepgemm_fp8_gemm_transform_scale(
+    const deepgemm_fp8_gemm_scale_transform_params_t* params) {
+  if (params == nullptr) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "FP8 GEMM scale transform params must not be null");
+  }
+  return ffi_call([&]() {
+    deepgemm_rs::launch_fp8_gemm_transform_scale(*params);
+  });
+}
+
+extern "C" deepgemm_status_t deepgemm_fp8_gemm_nt(
+    const deepgemm_fp8_gemm_nt_params_t* params) {
+  if (params == nullptr) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "FP8 GEMM params must not be null");
+  }
+  return ffi_call([&]() {
+    deepgemm_rs::launch_fp8_gemm_nt(*params);
   });
 }

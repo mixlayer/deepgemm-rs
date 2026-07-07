@@ -134,7 +134,12 @@ impl TensorLayout2D {
         }
     }
 
-    /// Returns the tensor spec for the physical allocation.
+    /// Returns the tensor spec for layouts whose allocation has the same orientation
+    /// as the logical tensor.
+    ///
+    /// Some helpers, such as FP8 GEMM scale layouts, return a row-major backing
+    /// `allocation_shape` plus a transposed logical view. For those, allocate
+    /// `allocation_shape` contiguously and use `logical_spec` for the launched view.
     pub fn allocation_spec(self) -> TensorSpec<2> {
         TensorSpec {
             dtype: self.dtype,

@@ -79,6 +79,19 @@ typedef struct deepgemm_paged_mqa_logits_metadata_layout_params_t {
   int64_t num_sms;
 } deepgemm_paged_mqa_logits_metadata_layout_params_t;
 
+typedef struct deepgemm_fp8_gemm_nt_output_layout_params_t {
+  int64_t m;
+  int64_t n;
+  deepgemm_dtype_t output_dtype;
+} deepgemm_fp8_gemm_nt_output_layout_params_t;
+
+typedef struct deepgemm_fp8_gemm_scale_layout_params_t {
+  int64_t mn;
+  int64_t k;
+  int64_t gran_k;
+  deepgemm_dtype_t scale_dtype;
+} deepgemm_fp8_gemm_scale_layout_params_t;
+
 typedef struct deepgemm_mqa_logits_params_t {
   deepgemm_tensor_t q;
   bool has_q_scale;
@@ -122,6 +135,24 @@ typedef struct deepgemm_paged_mqa_logits_params_t {
   deepgemm_cuda_stream_t stream;
 } deepgemm_paged_mqa_logits_params_t;
 
+typedef struct deepgemm_fp8_gemm_scale_transform_params_t {
+  deepgemm_tensor_t scale;
+  deepgemm_tensor_mut_t transformed;
+  int64_t mn;
+  int64_t k;
+  int64_t gran_k;
+  deepgemm_cuda_stream_t stream;
+} deepgemm_fp8_gemm_scale_transform_params_t;
+
+typedef struct deepgemm_fp8_gemm_nt_params_t {
+  deepgemm_tensor_t a;
+  deepgemm_tensor_t a_scale;
+  deepgemm_tensor_t b;
+  deepgemm_tensor_t b_scale;
+  deepgemm_tensor_mut_t d;
+  deepgemm_cuda_stream_t stream;
+} deepgemm_fp8_gemm_nt_params_t;
+
 const char* deepgemm_last_error(void);
 
 deepgemm_status_t deepgemm_init(
@@ -160,6 +191,16 @@ deepgemm_status_t deepgemm_paged_mqa_logits_metadata_layout(
   deepgemm_tensor_layout_2d_t* out
 );
 
+deepgemm_status_t deepgemm_fp8_gemm_nt_output_layout(
+  const deepgemm_fp8_gemm_nt_output_layout_params_t* params,
+  deepgemm_tensor_layout_2d_t* out
+);
+
+deepgemm_status_t deepgemm_fp8_gemm_scale_layout(
+  const deepgemm_fp8_gemm_scale_layout_params_t* params,
+  deepgemm_tensor_layout_2d_t* out
+);
+
 deepgemm_status_t deepgemm_fp8_fp4_mqa_logits(
   const deepgemm_mqa_logits_params_t* params
 );
@@ -170,6 +211,14 @@ deepgemm_status_t deepgemm_paged_mqa_logits_metadata(
 
 deepgemm_status_t deepgemm_fp8_fp4_paged_mqa_logits(
   const deepgemm_paged_mqa_logits_params_t* params
+);
+
+deepgemm_status_t deepgemm_fp8_gemm_transform_scale(
+  const deepgemm_fp8_gemm_scale_transform_params_t* params
+);
+
+deepgemm_status_t deepgemm_fp8_gemm_nt(
+  const deepgemm_fp8_gemm_nt_params_t* params
 );
 
 #ifdef __cplusplus
