@@ -22,8 +22,10 @@ pub use arch::Arch;
 pub use dtype::DType;
 pub use error::{Error, Result};
 pub use gemm::{
-    Fp8GemmNtLaunch, Fp8GemmNtSpec, Fp8GemmScaleTransformLaunch, Fp8GemmScaleTransformSpec,
-    fp8_gemm_nt, fp8_gemm_nt_output_layout, fp8_gemm_scale_layout, fp8_gemm_transform_scale,
+    Fp8BmmNtLaunch, Fp8BmmNtSpec, Fp8BmmScaleTransformLaunch, Fp8GemmNtLaunch, Fp8GemmNtSpec,
+    Fp8GemmScaleTransformLaunch, Fp8GemmScaleTransformSpec, fp8_bmm_nt, fp8_bmm_scale_spec,
+    fp8_bmm_transform_scale, fp8_gemm_nt, fp8_gemm_nt_output_layout, fp8_gemm_scale_layout,
+    fp8_gemm_transform_scale,
 };
 pub use mqa::{
     MqaLogitsLaunch, MqaLogitsSpec, PagedMqaLogitsLaunch, PagedMqaLogitsMetadataLaunch,

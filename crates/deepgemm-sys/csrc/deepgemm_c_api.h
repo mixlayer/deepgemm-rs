@@ -144,6 +144,16 @@ typedef struct deepgemm_fp8_gemm_scale_transform_params_t {
   deepgemm_cuda_stream_t stream;
 } deepgemm_fp8_gemm_scale_transform_params_t;
 
+typedef struct deepgemm_fp8_bmm_scale_transform_params_t {
+  deepgemm_tensor_t scale;
+  deepgemm_tensor_mut_t transformed;
+  int64_t batch_size;
+  int64_t mn;
+  int64_t k;
+  int64_t gran_k;
+  deepgemm_cuda_stream_t stream;
+} deepgemm_fp8_bmm_scale_transform_params_t;
+
 typedef struct deepgemm_fp8_gemm_nt_params_t {
   deepgemm_tensor_t a;
   deepgemm_tensor_t a_scale;
@@ -152,6 +162,15 @@ typedef struct deepgemm_fp8_gemm_nt_params_t {
   deepgemm_tensor_mut_t d;
   deepgemm_cuda_stream_t stream;
 } deepgemm_fp8_gemm_nt_params_t;
+
+typedef struct deepgemm_fp8_bmm_nt_params_t {
+  deepgemm_tensor_t a;
+  deepgemm_tensor_t a_scale;
+  deepgemm_tensor_t b;
+  deepgemm_tensor_t b_scale;
+  deepgemm_tensor_mut_t d;
+  deepgemm_cuda_stream_t stream;
+} deepgemm_fp8_bmm_nt_params_t;
 
 const char* deepgemm_last_error(void);
 
@@ -217,8 +236,16 @@ deepgemm_status_t deepgemm_fp8_gemm_transform_scale(
   const deepgemm_fp8_gemm_scale_transform_params_t* params
 );
 
+deepgemm_status_t deepgemm_fp8_bmm_transform_scale(
+  const deepgemm_fp8_bmm_scale_transform_params_t* params
+);
+
 deepgemm_status_t deepgemm_fp8_gemm_nt(
   const deepgemm_fp8_gemm_nt_params_t* params
+);
+
+deepgemm_status_t deepgemm_fp8_bmm_nt(
+  const deepgemm_fp8_bmm_nt_params_t* params
 );
 
 #ifdef __cplusplus

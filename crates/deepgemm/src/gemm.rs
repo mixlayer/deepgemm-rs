@@ -57,6 +57,26 @@ pub struct Fp8GemmNtSpec {
     pub d: TensorSpec<2>,
 }
 
+/// Shape and dtype contract for batched SM100 FP8 `nt` GEMM.
+///
+/// The operation computes `d[g] = a[g] @ b[g].T` for every batch group.
+/// Values and output are row-major contiguous. Packed scale tensors have
+/// logical shape `[batch_size, mn, ceil(k / 512)]` and strides
+/// `[aligned_mn * ceil(k / 512), 1, aligned_mn]`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Fp8BmmNtSpec {
+    /// LHS tensor: `FP8_E4M3 [batch_size, m, k]`.
+    pub a: TensorSpec<3>,
+    /// Packed LHS scale tensor.
+    pub a_scale: TensorSpec<3>,
+    /// RHS tensor: `FP8_E4M3 [batch_size, n, k]`, interpreted as `b.T`.
+    pub b: TensorSpec<3>,
+    /// Packed RHS scale tensor.
+    pub b_scale: TensorSpec<3>,
+    /// Output tensor: `BF16 [batch_size, m, n]`.
+    pub d: TensorSpec<3>,
+}
+
 /// Raw launch arguments for transforming FP8 GEMM scales.
 #[derive(Debug, Copy, Clone)]
 pub struct Fp8GemmScaleTransformLaunch {
@@ -66,6 +86,25 @@ pub struct Fp8GemmScaleTransformLaunch {
     /// `fp8_gemm_scale_layout(mn, k, gran_k, transformed_dtype)`.
     pub transformed: TensorOut<2>,
     /// Number of logical rows in `scale`.
+    pub mn: usize,
+    /// GEMM K dimension before scale blocking.
+    pub k: usize,
+    /// K-block granularity represented by one raw FP32 scale.
+    pub gran_k: usize,
+    /// CUDA stream for the launch.
+    pub stream: deepgemm_sys::deepgemm_cuda_stream_t,
+}
+
+/// Raw launch arguments for transforming batched SM100 FP8 GEMM scales.
+#[derive(Debug, Copy, Clone)]
+pub struct Fp8BmmScaleTransformLaunch {
+    /// Raw FP32 scales: `F32 [batch_size, mn, ceil(k / gran_k)]`.
+    pub scale: TensorArg<3>,
+    /// Packed UE8M0 scales consumed by batched GEMM.
+    pub transformed: TensorOut<3>,
+    /// Number of independent GEMM groups.
+    pub batch_size: usize,
+    /// Number of logical rows per group.
     pub mn: usize,
     /// GEMM K dimension before scale blocking.
     pub k: usize,
@@ -109,6 +148,36 @@ impl Fp8GemmNtLaunch {
     /// Returns the shape and dtype contract for this launch.
     pub fn spec(&self) -> Fp8GemmNtSpec {
         Fp8GemmNtSpec {
+            a: self.a.spec,
+            a_scale: self.a_scale.spec,
+            b: self.b.spec,
+            b_scale: self.b_scale.spec,
+            d: self.d.spec,
+        }
+    }
+}
+
+/// Raw launch arguments for batched SM100 FP8 `nt` GEMM.
+#[derive(Debug, Copy, Clone)]
+pub struct Fp8BmmNtLaunch {
+    /// LHS tensor: `FP8_E4M3 [batch_size, m, k]`.
+    pub a: TensorArg<3>,
+    /// Packed LHS scale tensor.
+    pub a_scale: TensorArg<3>,
+    /// RHS tensor: `FP8_E4M3 [batch_size, n, k]`, interpreted as `b.T`.
+    pub b: TensorArg<3>,
+    /// Packed RHS scale tensor.
+    pub b_scale: TensorArg<3>,
+    /// Output tensor: `BF16 [batch_size, m, n]`.
+    pub d: TensorOut<3>,
+    /// CUDA stream for the launch.
+    pub stream: deepgemm_sys::deepgemm_cuda_stream_t,
+}
+
+impl Fp8BmmNtLaunch {
+    /// Returns the shape and dtype contract for this launch.
+    pub fn spec(&self) -> Fp8BmmNtSpec {
+        Fp8BmmNtSpec {
             a: self.a.spec,
             a_scale: self.a_scale.spec,
             b: self.b.spec,
@@ -190,6 +259,83 @@ pub unsafe fn fp8_gemm_transform_scale(params: &Fp8GemmScaleTransformLaunch) -> 
     Error::check_raw_status(status)
 }
 
+/// Returns the logical packed scale spec for batched SM100 FP8 GEMM.
+///
+/// Allocate a contiguous `[batch_size, ceil(k / 512), aligned_mn]` backing
+/// tensor and expose it as the returned logical view.
+pub fn fp8_bmm_scale_spec(
+    batch_size: usize,
+    mn: usize,
+    k: usize,
+    gran_k: usize,
+) -> Result<TensorSpec<3>> {
+    require_positive(batch_size, "batch_size")?;
+    let layout = fp8_gemm_scale_layout(mn, k, gran_k, DType::PackedUe8M0)?;
+    let packed_k = layout.logical_shape[1];
+    Ok(TensorSpec {
+        dtype: DType::PackedUe8M0,
+        shape: [batch_size, mn, packed_k],
+        strides: [
+            i64_to_isize(
+                usize_to_i64(
+                    layout.allocation_shape[1]
+                        .checked_mul(packed_k)
+                        .ok_or_else(|| {
+                            Error::InvalidArgument("batched scale stride overflowed".into())
+                        })?,
+                    "batched scale stride",
+                )?,
+                "batched scale stride",
+            )?,
+            1,
+            layout.strides[1],
+        ],
+    })
+}
+
+/// Launches the batched SM100 FP8 scale transform through the raw C ABI.
+///
+/// # Safety
+///
+/// All pointers must refer to valid CUDA device buffers matching the attached
+/// shape and dtype metadata. Buffers must remain live until work enqueued on
+/// `stream` has completed.
+pub unsafe fn fp8_bmm_transform_scale(params: &Fp8BmmScaleTransformLaunch) -> Result<()> {
+    require_positive(params.batch_size, "batch_size")?;
+    require_positive(params.mn, "mn")?;
+    require_positive(params.k, "k")?;
+    require_positive(params.gran_k, "gran_k")?;
+    require_contiguous(&params.scale.spec, "scale")?;
+    require_dtype(&params.scale.spec, DType::F32, "scale")?;
+    require_shape(
+        params.scale.spec.shape,
+        [
+            params.batch_size,
+            params.mn,
+            ceil_div(params.k, params.gran_k)?,
+        ],
+        "scale",
+    )?;
+    require_spec(
+        params.transformed.spec,
+        fp8_bmm_scale_spec(params.batch_size, params.mn, params.k, params.gran_k)?,
+        "transformed",
+    )?;
+
+    let raw = deepgemm_sys::deepgemm_fp8_bmm_scale_transform_params_t {
+        scale: params.scale.to_raw()?,
+        transformed: params.transformed.to_raw()?,
+        batch_size: usize_to_i64(params.batch_size, "batch_size")?,
+        mn: usize_to_i64(params.mn, "mn")?,
+        k: usize_to_i64(params.k, "k")?,
+        gran_k: usize_to_i64(params.gran_k, "gran_k")?,
+        stream: params.stream,
+    };
+    // SAFETY: the caller upholds pointer and stream validity; `raw` is valid for this call.
+    let status = unsafe { deepgemm_sys::deepgemm_fp8_bmm_transform_scale(&raw) };
+    Error::check_raw_status(status)
+}
+
 /// Launches dense FP8 `nt` GEMM through the raw DeepGEMM C ABI.
 ///
 /// Computes `d = a @ b.T` with `a: FP8_E4M3 [m, k]`,
@@ -215,6 +361,36 @@ pub unsafe fn fp8_gemm_nt(params: &Fp8GemmNtLaunch) -> Result<()> {
     };
     // SAFETY: the caller upholds pointer and stream validity; `raw` is valid for this call.
     let status = unsafe { deepgemm_sys::deepgemm_fp8_gemm_nt(&raw) };
+    Error::check_raw_status(status)
+}
+
+/// Launches batched SM100 FP8 `nt` GEMM through the raw DeepGEMM C ABI.
+///
+/// Computes `d[g] = a[g] @ b[g].T` for all groups.
+///
+/// # Safety
+///
+/// All pointers must refer to valid CUDA device buffers matching the attached
+/// shape and dtype metadata. Buffers must remain live until work enqueued on
+/// `stream` has completed.
+pub unsafe fn fp8_bmm_nt(params: &Fp8BmmNtLaunch) -> Result<()> {
+    let arch = crate::runtime::device_info()?.arch()?;
+    if arch != Arch::Sm100 {
+        return Err(Error::UnsupportedArch(format!(
+            "FP8 BMM supports SM100, got {arch:?}"
+        )));
+    }
+    validate_fp8_bmm_nt_spec(&params.spec())?;
+    let raw = deepgemm_sys::deepgemm_fp8_bmm_nt_params_t {
+        a: params.a.to_raw()?,
+        a_scale: params.a_scale.to_raw()?,
+        b: params.b.to_raw()?,
+        b_scale: params.b_scale.to_raw()?,
+        d: params.d.to_raw()?,
+        stream: params.stream,
+    };
+    // SAFETY: the caller upholds pointer and stream validity; `raw` is valid for this call.
+    let status = unsafe { deepgemm_sys::deepgemm_fp8_bmm_nt(&raw) };
     Error::check_raw_status(status)
 }
 
@@ -287,6 +463,39 @@ fn validate_fp8_gemm_nt_spec(spec: &Fp8GemmNtSpec, arch: Arch) -> Result<GemmDim
     }
 
     Ok(GemmDims { m, n })
+}
+
+fn validate_fp8_bmm_nt_spec(spec: &Fp8BmmNtSpec) -> Result<()> {
+    require_contiguous(&spec.a, "a")?;
+    require_contiguous(&spec.b, "b")?;
+    require_contiguous(&spec.d, "d")?;
+    require_dtype(&spec.a, DType::Fp8E4M3, "a")?;
+    require_dtype(&spec.b, DType::Fp8E4M3, "b")?;
+    require_dtype(&spec.d, DType::BF16, "d")?;
+
+    let batch_size = spec.a.shape[0];
+    let m = spec.a.shape[1];
+    let k = spec.a.shape[2];
+    let n = spec.b.shape[1];
+    require_positive(batch_size, "batch_size")?;
+    require_positive(m, "m")?;
+    require_positive(n, "n")?;
+    require_positive(k, "k")?;
+    require_shape(spec.b.shape, [batch_size, n, k], "b")?;
+    require_shape(spec.d.shape, [batch_size, m, n], "d")?;
+    if n % 8 != 0 {
+        return Err(Error::InvalidArgument("n must be a multiple of 8".into()));
+    }
+    require_spec(
+        spec.a_scale,
+        fp8_bmm_scale_spec(batch_size, m, k, 128)?,
+        "a_scale",
+    )?;
+    require_spec(
+        spec.b_scale,
+        fp8_bmm_scale_spec(batch_size, n, k, 128)?,
+        "b_scale",
+    )
 }
 
 fn call_layout(
@@ -438,5 +647,25 @@ mod tests {
             d: TensorSpec::contiguous(DType::BF16, [128, 2112]),
         };
         assert!(validate_fp8_gemm_nt_spec(&spec, Arch::Sm100).is_ok());
+    }
+
+    #[test]
+    fn sm100_bmm_spec_accepts_deepseek_output_projection_shape() {
+        let batch_size = 8;
+        let m = 1;
+        let n = 1024;
+        let k = 4096;
+        let spec = Fp8BmmNtSpec {
+            a: TensorSpec::contiguous(DType::Fp8E4M3, [batch_size, m, k]),
+            a_scale: fp8_bmm_scale_spec(batch_size, m, k, 128).unwrap(),
+            b: TensorSpec::contiguous(DType::Fp8E4M3, [batch_size, n, k]),
+            b_scale: fp8_bmm_scale_spec(batch_size, n, k, 128).unwrap(),
+            d: TensorSpec::contiguous(DType::BF16, [batch_size, m, n]),
+        };
+        assert!(validate_fp8_bmm_nt_spec(&spec).is_ok());
+        assert_eq!(spec.a_scale.shape, [8, 1, 8]);
+        assert_eq!(spec.a_scale.strides, [32, 1, 4]);
+        assert_eq!(spec.b_scale.shape, [8, 1024, 8]);
+        assert_eq!(spec.b_scale.strides, [8192, 1, 1024]);
     }
 }

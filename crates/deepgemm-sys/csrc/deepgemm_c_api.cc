@@ -443,6 +443,16 @@ extern "C" deepgemm_status_t deepgemm_fp8_gemm_transform_scale(
   });
 }
 
+extern "C" deepgemm_status_t deepgemm_fp8_bmm_transform_scale(
+    const deepgemm_fp8_bmm_scale_transform_params_t* params) {
+  if (params == nullptr) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "FP8 BMM scale transform params must not be null");
+  }
+  return ffi_call([&]() {
+    deepgemm_rs::launch_fp8_bmm_transform_scale(*params);
+  });
+}
+
 extern "C" deepgemm_status_t deepgemm_fp8_gemm_nt(
     const deepgemm_fp8_gemm_nt_params_t* params) {
   if (params == nullptr) {
@@ -450,5 +460,15 @@ extern "C" deepgemm_status_t deepgemm_fp8_gemm_nt(
   }
   return ffi_call([&]() {
     deepgemm_rs::launch_fp8_gemm_nt(*params);
+  });
+}
+
+extern "C" deepgemm_status_t deepgemm_fp8_bmm_nt(
+    const deepgemm_fp8_bmm_nt_params_t* params) {
+  if (params == nullptr) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "FP8 BMM params must not be null");
+  }
+  return ffi_call([&]() {
+    deepgemm_rs::launch_fp8_bmm_nt(*params);
   });
 }

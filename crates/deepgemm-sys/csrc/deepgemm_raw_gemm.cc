@@ -239,6 +239,12 @@ void require_positive_2d_shape(const int64_t* shape, const char* name) {
   }
 }
 
+void require_positive_3d_shape(const int64_t* shape, const char* name) {
+  if (shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, std::string(name) + " dimensions must be positive");
+  }
+}
+
 void require_contiguous_2d(
     const deepgemm_tensor_t& tensor,
     deepgemm_dtype_t dtype,
@@ -259,6 +265,32 @@ void require_contiguous_2d_mut(
   require_dtype(tensor.dtype, dtype, name);
   require_positive_2d_shape(tensor.shape, name);
   if (tensor.stride[0] != tensor.shape[1] || tensor.stride[1] != 1) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, std::string(name) + " must be row-major contiguous");
+  }
+}
+
+void require_contiguous_3d(
+    const deepgemm_tensor_t& tensor,
+    deepgemm_dtype_t dtype,
+    const char* name) {
+  require_tensor_rank(tensor, 3, name);
+  require_dtype(tensor.dtype, dtype, name);
+  require_positive_3d_shape(tensor.shape, name);
+  if (tensor.stride[0] != tensor.shape[1] * tensor.shape[2] ||
+      tensor.stride[1] != tensor.shape[2] || tensor.stride[2] != 1) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, std::string(name) + " must be row-major contiguous");
+  }
+}
+
+void require_contiguous_3d_mut(
+    const deepgemm_tensor_mut_t& tensor,
+    deepgemm_dtype_t dtype,
+    const char* name) {
+  require_tensor_mut_rank(tensor, 3, name);
+  require_dtype(tensor.dtype, dtype, name);
+  require_positive_3d_shape(tensor.shape, name);
+  if (tensor.stride[0] != tensor.shape[1] * tensor.shape[2] ||
+      tensor.stride[1] != tensor.shape[2] || tensor.stride[2] != 1) {
     throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, std::string(name) + " must be row-major contiguous");
   }
 }
@@ -323,6 +355,54 @@ void require_mn_major_scale_out(
     std::ostringstream message;
     message << name << " must have shape [" << mn << ", " << scale_cols
             << "] and strides [1, " << aligned_mn << "]";
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, message.str());
+  }
+}
+
+void require_batched_mn_major_scale(
+    const deepgemm_tensor_t& tensor,
+    int64_t batch_size,
+    int64_t mn,
+    int64_t k,
+    int gran_k,
+    deepgemm_dtype_t dtype,
+    const char* name) {
+  require_tensor_rank(tensor, 3, name);
+  require_dtype(tensor.dtype, dtype, name);
+  const int64_t scale_cols = ceil_div_i64(k, scale_k_divisor(gran_k, dtype));
+  const int64_t aligned_mn = get_tma_aligned_size(mn, dtype_element_size(dtype));
+  if (tensor.shape[0] != batch_size || tensor.shape[1] != mn ||
+      tensor.shape[2] != scale_cols ||
+      tensor.stride[0] != aligned_mn * scale_cols ||
+      tensor.stride[1] != 1 || tensor.stride[2] != aligned_mn) {
+    std::ostringstream message;
+    message << name << " must have shape [" << batch_size << ", " << mn << ", "
+            << scale_cols << "] and strides [" << aligned_mn * scale_cols
+            << ", 1, " << aligned_mn << "]";
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, message.str());
+  }
+}
+
+void require_batched_mn_major_scale_out(
+    const deepgemm_tensor_mut_t& tensor,
+    int64_t batch_size,
+    int64_t mn,
+    int64_t k,
+    int gran_k,
+    deepgemm_dtype_t dtype,
+    const char* name) {
+  require_tensor_mut_rank(tensor, 3, name);
+  require_dtype(tensor.dtype, dtype, name);
+  const int64_t scale_cols = ceil_div_i64(k, scale_k_divisor(gran_k, dtype));
+  const int64_t aligned_mn = get_tma_aligned_size(mn, dtype_element_size(dtype));
+  if (tensor.shape[0] != batch_size || tensor.shape[1] != mn ||
+      tensor.shape[2] != scale_cols ||
+      tensor.stride[0] != aligned_mn * scale_cols ||
+      tensor.stride[1] != 1 || tensor.stride[2] != aligned_mn) {
+    std::ostringstream message;
+    message << name << " must have shape [" << batch_size << ", " << mn << ", "
+            << scale_cols << "] and strides [" << aligned_mn * scale_cols
+            << ", 1, " << aligned_mn << "]";
     throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, message.str());
   }
 }
@@ -551,8 +631,14 @@ LaunchConfig sm100_launch_config() {
   return launch;
 }
 
-LayoutInfo sm100_layout_info(int m, int n, int num_sms, const GemmLayout& layout) {
+LayoutInfo sm100_layout_info(
+    int m,
+    int n,
+    int num_groups,
+    int num_sms,
+    const GemmLayout& layout) {
   const int64_t num_blocks =
+      static_cast<int64_t>(num_groups) *
       static_cast<int64_t>(ceil_div_int(m, layout.block_m)) *
       static_cast<int64_t>(ceil_div_int(n, layout.block_n));
   const int num_waves = as_i32(ceil_div_i64(num_blocks, num_sms), "SM100 waves");
@@ -662,16 +748,22 @@ std::vector<GemmLayout> sm100_layout_candidates(int m, int n, int k, int num_sms
   return candidates;
 }
 
-GemmConfig sm100_best_config(int m, int n, int k, int num_sms, LayoutInfo* selected_info) {
+GemmConfig sm100_best_config(
+    int m,
+    int n,
+    int k,
+    int num_groups,
+    int num_sms,
+    LayoutInfo* selected_info) {
   const auto candidates = sm100_layout_candidates(m, n, k, num_sms);
   if (candidates.empty()) {
     throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "no SM100 FP8 GEMM heuristic candidates");
   }
 
   GemmLayout best_layout = candidates.front();
-  LayoutInfo best_info = sm100_layout_info(m, n, num_sms, best_layout);
+  LayoutInfo best_info = sm100_layout_info(m, n, num_groups, num_sms, best_layout);
   for (size_t i = 1; i < candidates.size(); ++i) {
-    const auto info = sm100_layout_info(m, n, num_sms, candidates[i]);
+    const auto info = sm100_layout_info(m, n, num_groups, num_sms, candidates[i]);
     if (sm100_layout_is_better(info, best_info)) {
       best_layout = candidates[i];
       best_info = info;
@@ -722,6 +814,8 @@ std::string sm100_fp8_gemm_1d1d_code(
     int m,
     int n,
     int k,
+    int num_groups,
+    bool batched,
     int gran_k_a,
     int gran_k_b,
     const GemmConfig& config,
@@ -736,7 +830,7 @@ std::string sm100_fp8_gemm_1d1d_code(
       << "        " << gran_k_a << ", " << gran_k_b << ", " << gran_k_a << ",\n"
       << "        0, " << n << ", " << k << ",\n"
       << "        " << config.layout.block_m << ", " << config.layout.block_n << ", " << config.layout.block_k << ",\n"
-      << "        1,\n"
+      << "        " << num_groups << ",\n"
       << "        " << config.storage.swizzle_a_mode << ", "
       << config.storage.swizzle_b_mode << ", " << config.storage.swizzle_cd_mode << ",\n"
       << "        " << config.pipeline.num_stages << ",\n"
@@ -746,7 +840,7 @@ std::string sm100_fp8_gemm_1d1d_code(
       << (config.layout.cluster_n > 1 ? "true" : "false") << ",\n"
       << "        " << num_sms << ",\n"
       << "        " << (config.layout.swap_ab ? "true" : "false") << ", true,\n"
-      << "        GemmType::Normal, false,\n"
+      << "        GemmType::" << (batched ? "Batched" : "Normal") << ", false,\n"
       << "        cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::bfloat16_t,\n"
       << "        epilogue::transform::EpilogueIdentity\n"
       << "    >);\n"
@@ -872,44 +966,116 @@ void launch_sm90_fp8_gemm_nt(
       tensor_map_sfa);
 }
 
-void launch_sm100_fp8_gemm_nt(
-    const deepgemm_fp8_gemm_nt_params_t& params,
+template <typename Params>
+void launch_sm100_fp8_gemm_nt_impl(
+    const Params& params,
+    int batch_size,
     int m,
     int n,
     int k,
+    bool batched,
     int num_sms) {
   constexpr int gran_k_a = 128;
   constexpr int gran_k_b = 128;
   LayoutInfo layout_info;
-  const auto config = sm100_best_config(m, n, k, num_sms, &layout_info);
-  print_gemm_config_once("SM100", m, n, k, num_sms, config, layout_info);
-
-  require_mn_major_scale(params.a_scale, m, k, gran_k_a, DEEPGEMM_DTYPE_PACKED_UE8M0, "a_scale");
-  require_mn_major_scale(params.b_scale, n, k, gran_k_b, DEEPGEMM_DTYPE_PACKED_UE8M0, "b_scale");
-
-  const auto tensor_map_a = make_tma_2d_desc(
-      params.a.data,
-      params.a.dtype,
-      k,
+  const auto config =
+      sm100_best_config(m, n, k, batch_size, num_sms, &layout_info);
+  print_gemm_config_once(
+      batched ? "SM100 BMM" : "SM100",
       m,
-      config.layout.block_k,
-      config.storage.load_block_m,
-      as_i32(params.a.stride[0], "a stride(0)"),
-      config.storage.swizzle_a_mode);
-  const auto tensor_map_b = make_tma_2d_desc(
-      params.b.data,
-      params.b.dtype,
-      k,
       n,
-      config.layout.block_k,
-      config.storage.load_block_n,
-      as_i32(params.b.stride[0], "b stride(0)"),
-      config.storage.swizzle_b_mode);
+      k,
+      num_sms,
+      config,
+      layout_info);
+
+  if (batched) {
+    require_batched_mn_major_scale(
+        params.a_scale,
+        batch_size,
+        m,
+        k,
+        gran_k_a,
+        DEEPGEMM_DTYPE_PACKED_UE8M0,
+        "a_scale");
+    require_batched_mn_major_scale(
+        params.b_scale,
+        batch_size,
+        n,
+        k,
+        gran_k_b,
+        DEEPGEMM_DTYPE_PACKED_UE8M0,
+        "b_scale");
+  } else {
+    require_mn_major_scale(
+        params.a_scale,
+        m,
+        k,
+        gran_k_a,
+        DEEPGEMM_DTYPE_PACKED_UE8M0,
+        "a_scale");
+    require_mn_major_scale(
+        params.b_scale,
+        n,
+        k,
+        gran_k_b,
+        DEEPGEMM_DTYPE_PACKED_UE8M0,
+        "b_scale");
+  }
+
+  const auto tensor_map_a = batched
+      ? make_tma_3d_desc(
+            params.a.data,
+            params.a.dtype,
+            k,
+            m,
+            batch_size,
+            config.layout.block_k,
+            config.storage.load_block_m,
+            1,
+            as_i32(params.a.stride[1], "a stride(1)"),
+            as_i32(params.a.stride[0], "a stride(0)"),
+            config.storage.swizzle_a_mode)
+      : make_tma_2d_desc(
+            params.a.data,
+            params.a.dtype,
+            k,
+            m,
+            config.layout.block_k,
+            config.storage.load_block_m,
+            as_i32(params.a.stride[0], "a stride(0)"),
+            config.storage.swizzle_a_mode);
+  const auto tensor_map_b = batched
+      ? make_tma_3d_desc(
+            params.b.data,
+            params.b.dtype,
+            k,
+            n,
+            batch_size,
+            config.layout.block_k,
+            config.storage.load_block_n,
+            1,
+            as_i32(params.b.stride[1], "b stride(1)"),
+            as_i32(params.b.stride[0], "b stride(0)"),
+            config.storage.swizzle_b_mode)
+      : make_tma_2d_desc(
+            params.b.data,
+            params.b.dtype,
+            k,
+            n,
+            config.layout.block_k,
+            config.storage.load_block_n,
+            as_i32(params.b.stride[0], "b stride(0)"),
+            config.storage.swizzle_b_mode);
+  const int batched_scale_k =
+      as_i32(
+          static_cast<int64_t>(batch_size) * ceil_div_i64(k, gran_k_a * 4),
+          "batched packed scale k blocks");
   const auto tensor_map_sfa = make_tma_2d_desc(
       params.a_scale.data,
       params.a_scale.dtype,
       tma_aligned_mn(m, params.a_scale.dtype, "a_scale aligned m"),
-      as_i32(ceil_div_i64(k, gran_k_a * 4), "a_scale packed k blocks"),
+      batched_scale_k,
       config.layout.block_m,
       1,
       tma_aligned_mn(m, params.a_scale.dtype, "a_scale stride"),
@@ -918,27 +1084,42 @@ void launch_sm100_fp8_gemm_nt(
       params.b_scale.data,
       params.b_scale.dtype,
       tma_aligned_mn(n, params.b_scale.dtype, "b_scale aligned n"),
-      as_i32(ceil_div_i64(k, gran_k_b * 4), "b_scale packed k blocks"),
+      batched_scale_k,
       config.layout.block_n,
       1,
       tma_aligned_mn(n, params.b_scale.dtype, "b_scale stride"),
       0);
-  const auto tensor_map_cd = make_tma_2d_desc(
-      params.d.data,
-      params.d.dtype,
-      n,
-      m,
-      config.storage.store_block_n,
-      config.storage.store_block_m,
-      as_i32(params.d.stride[0], "d stride(0)"),
-      config.storage.swizzle_cd_mode);
+  const auto tensor_map_cd = batched
+      ? make_tma_3d_desc(
+            params.d.data,
+            params.d.dtype,
+            n,
+            m,
+            batch_size,
+            config.storage.store_block_n,
+            config.storage.store_block_m,
+            1,
+            as_i32(params.d.stride[1], "d stride(1)"),
+            as_i32(params.d.stride[0], "d stride(0)"),
+            config.storage.swizzle_cd_mode)
+      : make_tma_2d_desc(
+            params.d.data,
+            params.d.dtype,
+            n,
+            m,
+            config.storage.store_block_n,
+            config.storage.store_block_m,
+            as_i32(params.d.stride[0], "d stride(0)"),
+            config.storage.swizzle_cd_mode);
 
   const auto runtime = build_kernel(
-      "sm100_fp8_gemm_1d1d",
+      batched ? "sm100_fp8_bmm_1d1d" : "sm100_fp8_gemm_1d1d",
       sm100_fp8_gemm_1d1d_code(
           m,
           n,
           k,
+          batch_size,
+          batched,
           gran_k_a,
           gran_k_b,
           config,
@@ -969,6 +1150,67 @@ void launch_sm100_fp8_gemm_nt(
       tensor_map_sfa,
       tensor_map_sfb,
       tensor_map_cd);
+}
+
+void launch_sm100_fp8_gemm_nt(
+    const deepgemm_fp8_gemm_nt_params_t& params,
+    int m,
+    int n,
+    int k,
+    int num_sms) {
+  launch_sm100_fp8_gemm_nt_impl(params, 1, m, n, k, false, num_sms);
+}
+
+void validate_common_bmm_nt(
+    const deepgemm_fp8_bmm_nt_params_t& params,
+    int64_t* batch_size_out,
+    int64_t* m_out,
+    int64_t* n_out,
+    int64_t* k_out) {
+  require_contiguous_3d(params.a, DEEPGEMM_DTYPE_FP8_E4M3, "a");
+  require_contiguous_3d(params.b, DEEPGEMM_DTYPE_FP8_E4M3, "b");
+  require_contiguous_3d_mut(params.d, DEEPGEMM_DTYPE_BF16, "d");
+
+  const int64_t batch_size = params.a.shape[0];
+  const int64_t m = params.a.shape[1];
+  const int64_t k = params.a.shape[2];
+  const int64_t n = params.b.shape[1];
+  if (params.b.shape[0] != batch_size || params.b.shape[2] != k) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "b shape must be [batch_size, n, k] with the same batch_size and k as a");
+  }
+  if (params.d.shape[0] != batch_size ||
+      params.d.shape[1] != m || params.d.shape[2] != n) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "d shape must be [batch_size, m, n]");
+  }
+  if (n % 8 != 0) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "n must be a multiple of 8");
+  }
+
+  *batch_size_out = batch_size;
+  *m_out = m;
+  *n_out = n;
+  *k_out = k;
+}
+
+void launch_sm100_fp8_bmm_nt(
+    const deepgemm_fp8_bmm_nt_params_t& params,
+    int batch_size,
+    int m,
+    int n,
+    int k,
+    int num_sms) {
+  launch_sm100_fp8_gemm_nt_impl(
+      params,
+      batch_size,
+      m,
+      n,
+      k,
+      true,
+      num_sms);
 }
 
 }  // namespace
@@ -1058,6 +1300,80 @@ void launch_fp8_gemm_transform_scale(
       m_alignment);
 }
 
+void launch_fp8_bmm_transform_scale(
+    const deepgemm_fp8_bmm_scale_transform_params_t& params) {
+  require_contiguous_3d(params.scale, DEEPGEMM_DTYPE_F32, "scale");
+  const int64_t batch_size = params.batch_size;
+  const int64_t mn = params.mn;
+  const int64_t k = params.k;
+  const int64_t gran_k_i64 = params.gran_k;
+  if (batch_size <= 0 || mn <= 0 || k <= 0 ||
+      gran_k_i64 <= 0 || gran_k_i64 > INT32_MAX) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "batch_size, mn, k, and gran_k must be positive");
+  }
+  const int gran_k = static_cast<int>(gran_k_i64);
+  const int64_t sf_k = ceil_div_i64(k, gran_k);
+  if (params.scale.shape[0] != batch_size ||
+      params.scale.shape[1] != mn || params.scale.shape[2] != sf_k) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "scale shape must be [batch_size, mn, ceil(k / gran_k)]");
+  }
+  if (params.transformed.dtype != DEEPGEMM_DTYPE_PACKED_UE8M0) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "batched transformed scale dtype must be packed UE8M0");
+  }
+  require_batched_mn_major_scale_out(
+      params.transformed,
+      batch_size,
+      mn,
+      k,
+      gran_k,
+      DEEPGEMM_DTYPE_PACKED_UE8M0,
+      "transformed");
+  if (sf_k <= 0 || sf_k > 512) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "scale K blocks must be between 1 and 512");
+  }
+
+  constexpr int block_mn = 48;
+  constexpr int num_threads = 512;
+  const int smem_size =
+      block_mn * as_i32(sf_k, "pack sf_k") * static_cast<int>(sizeof(float));
+  const auto runtime = build_kernel(
+      "transpose_and_pack_fp32_into_ue8m0",
+      transpose_and_pack_fp32_code(
+          num_threads,
+          block_mn,
+          as_i32(sf_k, "sf_k")));
+  LaunchArgs launch_args;
+  launch_args.grid_x =
+      as_i32(ceil_div_i64(mn, block_mn), "batched pack grid x");
+  launch_args.grid_y = as_i32(batch_size, "batched pack grid y");
+  launch_args.num_threads = num_threads;
+  launch_args.smem_size = smem_size;
+  launch_args.enable_pdl = pdl_enabled();
+  auto* scale =
+      const_cast<float*>(reinterpret_cast<const float*>(params.scale.data));
+  auto* transformed = reinterpret_cast<uint32_t*>(params.transformed.data);
+  uint32_t* grouped_layout = nullptr;
+  const auto mn_arg = static_cast<uint32_t>(mn);
+  const uint32_t m_alignment = 0;
+  launch_kernel(
+      runtime,
+      reinterpret_cast<CUstream>(params.stream),
+      launch_args,
+      scale,
+      transformed,
+      mn_arg,
+      grouped_layout,
+      m_alignment);
+}
+
 void launch_fp8_gemm_nt(
     const deepgemm_fp8_gemm_nt_params_t& params) {
   int64_t m_i64 = 0;
@@ -1081,6 +1397,42 @@ void launch_fp8_gemm_nt(
 
   std::ostringstream message;
   message << "FP8 GEMM supports SM90 or SM100, got compute capability "
+          << device.major << "." << device.minor;
+  throw_status(DEEPGEMM_STATUS_UNSUPPORTED_ARCH, message.str());
+}
+
+void launch_fp8_bmm_nt(
+    const deepgemm_fp8_bmm_nt_params_t& params) {
+  int64_t batch_size_i64 = 0;
+  int64_t m_i64 = 0;
+  int64_t n_i64 = 0;
+  int64_t k_i64 = 0;
+  validate_common_bmm_nt(
+      params,
+      &batch_size_i64,
+      &m_i64,
+      &n_i64,
+      &k_i64);
+  const int batch_size = as_i32(batch_size_i64, "batch_size");
+  const int m = as_i32(m_i64, "m");
+  const int n = as_i32(n_i64, "n");
+  const int k = as_i32(k_i64, "k");
+  const int num_sms = effective_num_sms();
+
+  const auto device = current_device_info();
+  if (device.major == 10) {
+    launch_sm100_fp8_bmm_nt(
+        params,
+        batch_size,
+        m,
+        n,
+        k,
+        num_sms);
+    return;
+  }
+
+  std::ostringstream message;
+  message << "FP8 BMM supports SM100, got compute capability "
           << device.major << "." << device.minor;
   throw_status(DEEPGEMM_STATUS_UNSUPPORTED_ARCH, message.str());
 }

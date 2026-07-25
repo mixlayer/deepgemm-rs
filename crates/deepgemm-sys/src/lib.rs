@@ -181,7 +181,30 @@ pub struct deepgemm_fp8_gemm_scale_transform_params_t {
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct deepgemm_fp8_bmm_scale_transform_params_t {
+    pub scale: deepgemm_tensor_t,
+    pub transformed: deepgemm_tensor_mut_t,
+    pub batch_size: i64,
+    pub mn: i64,
+    pub k: i64,
+    pub gran_k: i64,
+    pub stream: deepgemm_cuda_stream_t,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct deepgemm_fp8_gemm_nt_params_t {
+    pub a: deepgemm_tensor_t,
+    pub a_scale: deepgemm_tensor_t,
+    pub b: deepgemm_tensor_t,
+    pub b_scale: deepgemm_tensor_t,
+    pub d: deepgemm_tensor_mut_t,
+    pub stream: deepgemm_cuda_stream_t,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct deepgemm_fp8_bmm_nt_params_t {
     pub a: deepgemm_tensor_t,
     pub a_scale: deepgemm_tensor_t,
     pub b: deepgemm_tensor_t,
@@ -248,5 +271,11 @@ unsafe extern "C" {
         params: *const deepgemm_fp8_gemm_scale_transform_params_t,
     ) -> deepgemm_status_t;
 
+    pub fn deepgemm_fp8_bmm_transform_scale(
+        params: *const deepgemm_fp8_bmm_scale_transform_params_t,
+    ) -> deepgemm_status_t;
+
     pub fn deepgemm_fp8_gemm_nt(params: *const deepgemm_fp8_gemm_nt_params_t) -> deepgemm_status_t;
+
+    pub fn deepgemm_fp8_bmm_nt(params: *const deepgemm_fp8_bmm_nt_params_t) -> deepgemm_status_t;
 }
