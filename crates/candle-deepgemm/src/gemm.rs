@@ -317,6 +317,7 @@ fn validate_workspace_inputs(
     a_scale: &Tensor,
     b: &Tensor,
 ) -> Result<()> {
+    ensure_same_device(&workspace.output, b, "b")?;
     ensure_same_device(b, a, "a")?;
     ensure_same_device(b, a_scale, "a_scale")?;
     ensure_rank(a, 2, "a")?;
