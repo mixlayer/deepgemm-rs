@@ -308,7 +308,26 @@ impl Fp8BmmNtWorkspace {
             self.k,
             &stream,
         )?;
+        self.forward_transformed(a, &self.a_scale_transformed, b)
+    }
 
+    /// Launches with a caller-provided packed, TMA-aligned LHS scale tensor.
+    ///
+    /// This skips the scale transform for fused quantizers that emit
+    /// DeepGEMM's SM100 scale layout directly.
+    pub fn forward_transformed(&self, a: &Tensor, a_scale: &Tensor, b: &Tensor) -> Result<Tensor> {
+        validate_bmm_values(self, a, b)?;
+        ensure_same_device(a, a_scale, "a_scale")?;
+        ensure_rank(a_scale, 3, "a_scale")?;
+        ensure_dtype(a_scale, CandleDType::I32, "a_scale")?;
+        let a_scale_spec = tensor_spec(a_scale, DeepGemmDType::PackedUe8M0, "a_scale")?;
+        if a_scale_spec != self.a_scale_spec {
+            return invalid_arg(format!(
+                "a_scale spec must be {:?}, got {a_scale_spec:?}",
+                self.a_scale_spec
+            ));
+        }
+        let (stream, _) = stream_and_device_id(a)?;
         let a_spec = tensor_spec(a, DeepGemmDType::Fp8E4M3, "a")?;
         let b_spec = tensor_spec(b, DeepGemmDType::Fp8E4M3, "b")?;
         let d_spec = tensor_spec(&self.output, DeepGemmDType::BF16, "d")?;
@@ -320,7 +339,7 @@ impl Fp8BmmNtWorkspace {
             &stream,
             "a",
         )?;
-        let (a_scale_storage, a_scale_layout) = self.a_scale_transformed.storage_and_layout();
+        let (a_scale_storage, a_scale_layout) = a_scale.storage_and_layout();
         let a_scale_ptr = tensor_ptr_by_dtype(
             &a_scale_storage,
             CandleDType::I32,
@@ -368,6 +387,11 @@ impl Fp8BmmNtWorkspace {
         // launch specs, all on the launch stream's device.
         unsafe { deepgemm::fp8_bmm_nt(&launch)? };
         Ok(self.output.clone())
+    }
+
+    /// Returns the persistent packed LHS scale buffer.
+    pub fn transformed_a_scale(&self) -> &Tensor {
+        &self.a_scale_transformed
     }
 
     /// Returns the persistent BF16 output tensor.
@@ -618,32 +642,37 @@ fn validate_bmm_workspace_inputs(
     a_scale: &Tensor,
     b: &Tensor,
 ) -> Result<()> {
-    ensure_same_device(&workspace.output, b, "b")?;
-    ensure_same_device(b, a, "a")?;
+    validate_bmm_values(workspace, a, b)?;
     ensure_same_device(b, a_scale, "a_scale")?;
-    ensure_rank(a, 3, "a")?;
     ensure_rank(a_scale, 3, "a_scale")?;
-    ensure_rank(b, 3, "b")?;
-    ensure_dtype(a, CandleDType::F8E4M3, "a")?;
     ensure_dtype(a_scale, CandleDType::F32, "a_scale")?;
-    ensure_dtype(b, CandleDType::F8E4M3, "b")?;
-    let expected_a = [workspace.batch_size, workspace.m, workspace.k];
     let expected_a_scale = [
         workspace.batch_size,
         workspace.m,
         ceil_div(workspace.k, 128)?,
     ];
+    if a_scale.dims() != expected_a_scale {
+        return invalid_arg(format!(
+            "a_scale shape must be {expected_a_scale:?}, got {:?}",
+            a_scale.dims()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bmm_values(workspace: &Fp8BmmNtWorkspace, a: &Tensor, b: &Tensor) -> Result<()> {
+    ensure_same_device(&workspace.output, b, "b")?;
+    ensure_same_device(b, a, "a")?;
+    ensure_rank(a, 3, "a")?;
+    ensure_rank(b, 3, "b")?;
+    ensure_dtype(a, CandleDType::F8E4M3, "a")?;
+    ensure_dtype(b, CandleDType::F8E4M3, "b")?;
+    let expected_a = [workspace.batch_size, workspace.m, workspace.k];
     let expected_b = [workspace.batch_size, workspace.n, workspace.k];
     if a.dims() != expected_a {
         return invalid_arg(format!(
             "a shape must be {expected_a:?}, got {:?}",
             a.dims()
-        ));
-    }
-    if a_scale.dims() != expected_a_scale {
-        return invalid_arg(format!(
-            "a_scale shape must be {expected_a_scale:?}, got {:?}",
-            a_scale.dims()
         ));
     }
     if b.dims() != expected_b {
@@ -770,7 +799,9 @@ mod tests {
             &device,
         )?;
         let b_scale = Tensor::ones((batch_size, n, k / 128), DType::F32, &device)?;
-        let output = fp8_bmm_nt(&a, &a_scale, &b, &b_scale)?;
+        let workspace = Fp8BmmNtWorkspace::new(m, &b, &b_scale)?;
+        workspace.forward(&a, &a_scale, &b)?;
+        let output = workspace.forward_transformed(&a, workspace.transformed_a_scale(), &b)?;
         let output = output
             .to_dtype(DType::F32)?
             .flatten_all()?
