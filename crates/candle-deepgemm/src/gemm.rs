@@ -16,6 +16,198 @@ use crate::{
     },
 };
 
+/// Reusable caller-owned buffers for dense FP8 `nt` GEMM.
+///
+/// The workspace keeps architecture-specific transformed scales and the GEMM
+/// output alive at stable addresses. This makes repeated launches safe to
+/// capture in a CUDA graph. A workspace is tied to one `(m, n, k)` shape and
+/// must not be used concurrently from multiple streams.
+#[derive(Debug, Clone)]
+pub struct Fp8GemmNtWorkspace {
+    arch: Arch,
+    m: usize,
+    n: usize,
+    k: usize,
+    a_scale_layout: deepgemm::TensorLayout2D,
+    a_scale_transformed: Tensor,
+    b_scale_launch_spec: TensorSpec<2>,
+    b_scale_transformed: Tensor,
+    d_layout: deepgemm::TensorLayout2D,
+    output: Tensor,
+}
+
+impl Fp8GemmNtWorkspace {
+    /// Allocates reusable buffers and transforms the static RHS scales.
+    ///
+    /// `m` is the number of input rows that each launch will process. `b` and
+    /// `b_scale` follow the same tensor contract as [`fp8_gemm_nt`].
+    pub fn new(m: usize, b: &Tensor, b_scale: &Tensor) -> Result<Self> {
+        ensure_rank(b, 2, "b")?;
+        ensure_rank(b_scale, 2, "b_scale")?;
+        ensure_dtype(b, CandleDType::F8E4M3, "b")?;
+        ensure_dtype(b_scale, CandleDType::F32, "b_scale")?;
+        ensure_same_device(b, b_scale, "b_scale")?;
+        if m == 0 {
+            return invalid_arg("m must be positive");
+        }
+
+        let n = b.dims()[0];
+        let k = b.dims()[1];
+        let (stream, device_id) = stream_and_device_id(b)?;
+        let device_info = deepgemm::device_info()?;
+        if device_info.device != device_id {
+            return invalid_arg(format!(
+                "b is on CUDA device {device_id}, but DeepGEMM current device is {}",
+                device_info.device
+            ));
+        }
+        let arch = device_info.arch()?;
+        let b_spec = tensor_spec(b, DeepGemmDType::Fp8E4M3, "b")?;
+        let a_spec = TensorSpec::contiguous(DeepGemmDType::Fp8E4M3, [m, k]);
+        let a_scale_layout = match arch {
+            Arch::Sm90 => deepgemm::fp8_gemm_scale_layout(m, k, 128, DeepGemmDType::F32)?,
+            Arch::Sm100 => deepgemm::fp8_gemm_scale_layout(m, k, 128, DeepGemmDType::PackedUe8M0)?,
+        };
+        let a_scale_transformed = allocate_transformed_scale(a_scale_layout, b.device())?;
+
+        let (b_scale_launch_spec, b_scale_transformed) = match arch {
+            Arch::Sm90 => {
+                let expected = [ceil_div(n, 128)?, ceil_div(k, 128)?];
+                let spec = tensor_spec(b_scale, DeepGemmDType::F32, "b_scale")?;
+                require_raw_scale(spec, expected, "b_scale")?;
+                (spec, b_scale.clone())
+            }
+            Arch::Sm100 => {
+                let raw_spec = tensor_spec(b_scale, DeepGemmDType::F32, "b_scale")?;
+                require_raw_scale(raw_spec, [n, ceil_div(k, 128)?], "b_scale")?;
+                let layout =
+                    deepgemm::fp8_gemm_scale_layout(n, k, 128, DeepGemmDType::PackedUe8M0)?;
+                let transformed = allocate_transformed_scale(layout, b.device())?;
+                transform_scale_into(b_scale, raw_spec, &transformed, layout, n, k, &stream)?;
+                (layout.logical_spec(), transformed)
+            }
+        };
+
+        let d_spec = TensorSpec::contiguous(DeepGemmDType::BF16, [m, n]);
+        let launch_spec = Fp8GemmNtSpec {
+            a: a_spec,
+            a_scale: a_scale_layout.logical_spec(),
+            b: b_spec,
+            b_scale: b_scale_launch_spec,
+            d: d_spec,
+        };
+        let d_layout = deepgemm::fp8_gemm_nt_output_layout(&launch_spec, arch)?;
+        let output = Tensor::zeros(
+            (d_layout.allocation_shape[0], d_layout.allocation_shape[1]),
+            CandleDType::BF16,
+            b.device(),
+        )?;
+
+        Ok(Self {
+            arch,
+            m,
+            n,
+            k,
+            a_scale_layout,
+            a_scale_transformed,
+            b_scale_launch_spec,
+            b_scale_transformed,
+            d_layout,
+            output,
+        })
+    }
+
+    /// Launches into this workspace's persistent output tensor.
+    ///
+    /// The returned tensor aliases the workspace output and is overwritten by
+    /// the next launch on this workspace.
+    pub fn forward(&self, a: &Tensor, a_scale: &Tensor, b: &Tensor) -> Result<Tensor> {
+        validate_workspace_inputs(self, a, a_scale, b)?;
+        let (stream, _) = stream_and_device_id(a)?;
+        let a_scale_raw_spec = tensor_spec(a_scale, DeepGemmDType::F32, "a_scale")?;
+        transform_scale_into(
+            a_scale,
+            a_scale_raw_spec,
+            &self.a_scale_transformed,
+            self.a_scale_layout,
+            self.m,
+            self.k,
+            &stream,
+        )?;
+
+        let a_spec = tensor_spec(a, DeepGemmDType::Fp8E4M3, "a")?;
+        let b_spec = tensor_spec(b, DeepGemmDType::Fp8E4M3, "b")?;
+        let (a_storage, a_layout) = a.storage_and_layout();
+        let a_ptr = tensor_ptr_by_dtype(
+            &a_storage,
+            CandleDType::F8E4M3,
+            a_layout.start_offset(),
+            &stream,
+            "a",
+        )?;
+        let (a_scale_storage, a_scale_storage_layout) =
+            self.a_scale_transformed.storage_and_layout();
+        let a_scale_ptr = tensor_ptr_by_dtype(
+            &a_scale_storage,
+            candle_dtype_for_deepgemm(self.a_scale_layout.dtype),
+            a_scale_storage_layout.start_offset(),
+            &stream,
+            "a_scale",
+        )?;
+        let (b_storage, b_layout) = b.storage_and_layout();
+        let b_ptr = tensor_ptr_by_dtype(
+            &b_storage,
+            CandleDType::F8E4M3,
+            b_layout.start_offset(),
+            &stream,
+            "b",
+        )?;
+        let (b_scale_storage, b_scale_layout) = self.b_scale_transformed.storage_and_layout();
+        let b_scale_ptr = tensor_ptr_by_dtype(
+            &b_scale_storage,
+            match self.arch {
+                Arch::Sm90 => CandleDType::F32,
+                Arch::Sm100 => CandleDType::I32,
+            },
+            b_scale_layout.start_offset(),
+            &stream,
+            "b_scale",
+        )?;
+        let (d_storage, d_layout) = self.output.storage_and_layout();
+        let d_ptr = tensor_ptr_by_dtype(
+            &d_storage,
+            CandleDType::BF16,
+            d_layout.start_offset(),
+            &stream,
+            "d",
+        )?;
+        let launch = Fp8GemmNtLaunch {
+            a: tensor_arg(a_ptr.as_const_void(), a_spec),
+            a_scale: tensor_arg(
+                a_scale_ptr.as_const_void(),
+                self.a_scale_layout.logical_spec(),
+            ),
+            b: tensor_arg(b_ptr.as_const_void(), b_spec),
+            b_scale: tensor_arg(b_scale_ptr.as_const_void(), self.b_scale_launch_spec),
+            d: TensorOut {
+                data: d_ptr.as_mut_void(),
+                spec: self.d_layout.logical_spec(),
+            },
+            stream: stream.cu_stream() as *mut std::ffi::c_void,
+        };
+
+        // SAFETY: the workspace owns live buffers matching the validated
+        // launch specs, all on the launch stream's device.
+        unsafe { deepgemm::fp8_gemm_nt(&launch)? };
+        Ok(self.output.clone())
+    }
+
+    /// Returns the persistent BF16 output tensor.
+    pub fn output(&self) -> &Tensor {
+        &self.output
+    }
+}
+
 /// Launches dense DeepGEMM FP8 `nt` GEMM on Candle CUDA tensors.
 ///
 /// Computes `d = a @ b.T`.
@@ -45,187 +237,57 @@ pub fn fp8_gemm_nt(a: &Tensor, a_scale: &Tensor, b: &Tensor, b_scale: &Tensor) -
 
     let m = a.dims()[0];
     let k = a.dims()[1];
-    let n = b.dims()[0];
     if b.dims()[1] != k {
         return invalid_arg("b shape must be [n, k] with the same k as a");
     }
 
-    let (stream, device_id) = stream_and_device_id(a)?;
-    let device_info = deepgemm::device_info()?;
-    if device_info.device != device_id {
-        return invalid_arg(format!(
-            "a is on CUDA device {device_id}, but DeepGEMM current device is {}",
-            device_info.device
-        ));
-    }
-    let arch = device_info.arch()?;
-
-    let a_spec = tensor_spec(a, DeepGemmDType::Fp8E4M3, "a")?;
-    let b_spec = tensor_spec(b, DeepGemmDType::Fp8E4M3, "b")?;
     let a_scale_raw_spec = tensor_spec(a_scale, DeepGemmDType::F32, "a_scale")?;
     require_raw_scale(a_scale_raw_spec, [m, ceil_div(k, 128)?], "a_scale")?;
-
-    let a_scale_layout = match arch {
-        Arch::Sm90 => deepgemm::fp8_gemm_scale_layout(m, k, 128, DeepGemmDType::F32)?,
-        Arch::Sm100 => deepgemm::fp8_gemm_scale_layout(m, k, 128, DeepGemmDType::PackedUe8M0)?,
-    };
-    let a_scale_transformed =
-        transform_scale(a_scale, a_scale_raw_spec, a_scale_layout, m, k, &stream)?;
-
-    let b_scale_tensor;
-    let b_scale_launch_spec;
-    match arch {
-        Arch::Sm90 => {
-            let expected = [ceil_div(n, 128)?, ceil_div(k, 128)?];
-            b_scale_launch_spec = tensor_spec(b_scale, DeepGemmDType::F32, "b_scale")?;
-            require_raw_scale(b_scale_launch_spec, expected, "b_scale")?;
-            b_scale_tensor = b_scale.clone();
-        }
-        Arch::Sm100 => {
-            let b_scale_raw_spec = tensor_spec(b_scale, DeepGemmDType::F32, "b_scale")?;
-            require_raw_scale(b_scale_raw_spec, [n, ceil_div(k, 128)?], "b_scale")?;
-            let b_scale_layout =
-                deepgemm::fp8_gemm_scale_layout(n, k, 128, DeepGemmDType::PackedUe8M0)?;
-            b_scale_tensor =
-                transform_scale(b_scale, b_scale_raw_spec, b_scale_layout, n, k, &stream)?;
-            b_scale_launch_spec = b_scale_layout.logical_spec();
-        }
-    }
-
-    let d_spec = TensorSpec {
-        dtype: DeepGemmDType::BF16,
-        shape: [m, n],
-        strides: [
-            isize::try_from(n).map_err(|_| crate::Error::Tensor("d stride overflow".into()))?,
-            1,
-        ],
-    };
-    let launch_spec = Fp8GemmNtSpec {
-        a: a_spec,
-        a_scale: a_scale_layout.logical_spec(),
-        b: b_spec,
-        b_scale: b_scale_launch_spec,
-        d: d_spec,
-    };
-    let d_layout = deepgemm::fp8_gemm_nt_output_layout(&launch_spec, arch)?;
-    let d = Tensor::zeros(
-        (d_layout.allocation_shape[0], d_layout.allocation_shape[1]),
-        CandleDType::BF16,
-        a.device(),
-    )?;
-
-    {
-        let (a_storage, a_layout) = a.storage_and_layout();
-        let a_ptr = tensor_ptr_by_dtype(
-            &a_storage,
-            CandleDType::F8E4M3,
-            a_layout.start_offset(),
-            &stream,
-            "a",
-        )?;
-        let (a_scale_storage, a_scale_layout_storage) = a_scale_transformed.storage_and_layout();
-        let a_scale_dtype = candle_dtype_for_deepgemm(a_scale_layout.dtype);
-        let a_scale_ptr = tensor_ptr_by_dtype(
-            &a_scale_storage,
-            a_scale_dtype,
-            a_scale_layout_storage.start_offset(),
-            &stream,
-            "a_scale",
-        )?;
-        let (b_storage, b_layout) = b.storage_and_layout();
-        let b_ptr = tensor_ptr_by_dtype(
-            &b_storage,
-            CandleDType::F8E4M3,
-            b_layout.start_offset(),
-            &stream,
-            "b",
-        )?;
-        let (b_scale_storage, b_scale_layout_storage) = b_scale_tensor.storage_and_layout();
-        let b_scale_dtype = match arch {
-            Arch::Sm90 => CandleDType::F32,
-            Arch::Sm100 => CandleDType::I32,
-        };
-        let b_scale_ptr = tensor_ptr_by_dtype(
-            &b_scale_storage,
-            b_scale_dtype,
-            b_scale_layout_storage.start_offset(),
-            &stream,
-            "b_scale",
-        )?;
-        let (d_storage, d_storage_layout) = d.storage_and_layout();
-        let d_ptr = tensor_ptr_by_dtype(
-            &d_storage,
-            CandleDType::BF16,
-            d_storage_layout.start_offset(),
-            &stream,
-            "d",
-        )?;
-
-        let launch = Fp8GemmNtLaunch {
-            a: tensor_arg(a_ptr.as_const_void(), a_spec),
-            a_scale: tensor_arg(a_scale_ptr.as_const_void(), a_scale_layout.logical_spec()),
-            b: tensor_arg(b_ptr.as_const_void(), b_spec),
-            b_scale: tensor_arg(b_scale_ptr.as_const_void(), b_scale_launch_spec),
-            d: TensorOut {
-                data: d_ptr.as_mut_void(),
-                spec: d_layout.logical_spec(),
-            },
-            stream: stream.cu_stream() as *mut std::ffi::c_void,
-        };
-
-        // SAFETY: all pointers come from live Candle CUDA tensors on the launch stream,
-        // and specs were validated by the DeepGEMM layout path before launch.
-        unsafe { deepgemm::fp8_gemm_nt(&launch)? };
-    }
-
-    Ok(d)
+    Fp8GemmNtWorkspace::new(m, b, b_scale)?.forward(a, a_scale, b)
 }
 
-fn transform_scale(
+fn transform_scale_into(
     scale: &Tensor,
     scale_spec: TensorSpec<2>,
+    transformed: &Tensor,
     transformed_layout: deepgemm::TensorLayout2D,
     mn: usize,
     k: usize,
     stream: &Arc<CudaStream>,
-) -> Result<Tensor> {
-    let transformed = allocate_transformed_scale(transformed_layout, scale.device())?;
-    {
-        let (scale_storage, scale_layout) = scale.storage_and_layout();
-        let scale_ptr = tensor_ptr_by_dtype(
-            &scale_storage,
-            CandleDType::F32,
-            scale_layout.start_offset(),
-            stream,
-            "scale",
-        )?;
-        let (transformed_storage, transformed_storage_layout) = transformed.storage_and_layout();
-        let transformed_dtype = candle_dtype_for_deepgemm(transformed_layout.dtype);
-        let transformed_ptr = tensor_ptr_by_dtype(
-            &transformed_storage,
-            transformed_dtype,
-            transformed_storage_layout.start_offset(),
-            stream,
-            "transformed",
-        )?;
+) -> Result<()> {
+    let (scale_storage, scale_layout) = scale.storage_and_layout();
+    let scale_ptr = tensor_ptr_by_dtype(
+        &scale_storage,
+        CandleDType::F32,
+        scale_layout.start_offset(),
+        stream,
+        "scale",
+    )?;
+    let (transformed_storage, transformed_storage_layout) = transformed.storage_and_layout();
+    let transformed_dtype = candle_dtype_for_deepgemm(transformed_layout.dtype);
+    let transformed_ptr = tensor_ptr_by_dtype(
+        &transformed_storage,
+        transformed_dtype,
+        transformed_storage_layout.start_offset(),
+        stream,
+        "transformed",
+    )?;
+    let launch = Fp8GemmScaleTransformLaunch {
+        scale: tensor_arg(scale_ptr.as_const_void(), scale_spec),
+        transformed: TensorOut {
+            data: transformed_ptr.as_mut_void(),
+            spec: transformed_layout.logical_spec(),
+        },
+        mn,
+        k,
+        gran_k: 128,
+        stream: stream.cu_stream() as *mut std::ffi::c_void,
+    };
 
-        let launch = Fp8GemmScaleTransformLaunch {
-            scale: tensor_arg(scale_ptr.as_const_void(), scale_spec),
-            transformed: TensorOut {
-                data: transformed_ptr.as_mut_void(),
-                spec: transformed_layout.logical_spec(),
-            },
-            mn,
-            k,
-            gran_k: 128,
-            stream: stream.cu_stream() as *mut std::ffi::c_void,
-        };
-
-        // SAFETY: pointers come from live Candle CUDA tensors on the launch stream,
-        // and specs were checked by the safe DeepGEMM wrapper.
-        unsafe { deepgemm::fp8_gemm_transform_scale(&launch)? };
-    }
-    Ok(transformed)
+    // SAFETY: pointers come from live Candle CUDA tensors on the launch stream,
+    // and specs were checked by the safe DeepGEMM wrapper.
+    unsafe { deepgemm::fp8_gemm_transform_scale(&launch)? };
+    Ok(())
 }
 
 fn allocate_transformed_scale(
@@ -245,6 +307,47 @@ fn allocate_transformed_scale(
 fn validate_devices(a: &Tensor, a_scale: &Tensor, b: &Tensor, b_scale: &Tensor) -> Result<()> {
     for (name, tensor) in [("a_scale", a_scale), ("b", b), ("b_scale", b_scale)] {
         ensure_same_device(a, tensor, name)?;
+    }
+    Ok(())
+}
+
+fn validate_workspace_inputs(
+    workspace: &Fp8GemmNtWorkspace,
+    a: &Tensor,
+    a_scale: &Tensor,
+    b: &Tensor,
+) -> Result<()> {
+    ensure_same_device(b, a, "a")?;
+    ensure_same_device(b, a_scale, "a_scale")?;
+    ensure_rank(a, 2, "a")?;
+    ensure_rank(a_scale, 2, "a_scale")?;
+    ensure_rank(b, 2, "b")?;
+    ensure_dtype(a, CandleDType::F8E4M3, "a")?;
+    ensure_dtype(a_scale, CandleDType::F32, "a_scale")?;
+    ensure_dtype(b, CandleDType::F8E4M3, "b")?;
+    if a.dims() != [workspace.m, workspace.k] {
+        return invalid_arg(format!(
+            "a shape must be [{}, {}], got {:?}",
+            workspace.m,
+            workspace.k,
+            a.dims()
+        ));
+    }
+    if a_scale.dims() != [workspace.m, ceil_div(workspace.k, 128)?] {
+        return invalid_arg(format!(
+            "a_scale shape must be [{}, {}], got {:?}",
+            workspace.m,
+            ceil_div(workspace.k, 128)?,
+            a_scale.dims()
+        ));
+    }
+    if b.dims() != [workspace.n, workspace.k] {
+        return invalid_arg(format!(
+            "b shape must be [{}, {}], got {:?}",
+            workspace.n,
+            workspace.k,
+            b.dims()
+        ));
     }
     Ok(())
 }
