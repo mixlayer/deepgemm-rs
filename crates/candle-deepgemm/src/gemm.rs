@@ -140,8 +140,31 @@ impl Fp8GemmNtWorkspace {
     /// The returned tensor aliases the workspace output and is overwritten by
     /// the next launch on this workspace.
     pub fn forward(&self, a: &Tensor, a_scale: &Tensor, b: &Tensor) -> Result<Tensor> {
-        validate_workspace_inputs(self, a, a_scale, b)?;
         let (stream, _) = stream_and_device_id(a)?;
+        self.forward_on_stream(a, a_scale, b, &stream)
+    }
+
+    /// Launches into this workspace's persistent output on `stream`.
+    ///
+    /// The stream must belong to the tensors' CUDA device. The returned tensor
+    /// aliases the workspace output and is overwritten by the next launch on
+    /// this workspace.
+    pub fn forward_on_stream(
+        &self,
+        a: &Tensor,
+        a_scale: &Tensor,
+        b: &Tensor,
+        stream: &Arc<CudaStream>,
+    ) -> Result<Tensor> {
+        validate_workspace_inputs(self, a, a_scale, b)?;
+        let (tensor_stream, _) = stream_and_device_id(a)?;
+        if stream.context().ordinal() != tensor_stream.context().ordinal() {
+            return invalid_arg(format!(
+                "stream is on CUDA device {}, but tensors are on CUDA device {}",
+                stream.context().ordinal(),
+                tensor_stream.context().ordinal()
+            ));
+        }
         let a_scale_raw_spec = tensor_spec(a_scale, DeepGemmDType::F32, "a_scale")?;
         transform_scale_into(
             a_scale,
@@ -150,7 +173,7 @@ impl Fp8GemmNtWorkspace {
             self.a_scale_layout,
             self.m,
             self.k,
-            &stream,
+            stream,
         )?;
 
         let a_spec = tensor_spec(a, DeepGemmDType::Fp8E4M3, "a")?;
@@ -160,7 +183,7 @@ impl Fp8GemmNtWorkspace {
             &a_storage,
             CandleDType::F8E4M3,
             a_layout.start_offset(),
-            &stream,
+            stream,
             "a",
         )?;
         let (a_scale_storage, a_scale_storage_layout) =
@@ -169,7 +192,7 @@ impl Fp8GemmNtWorkspace {
             &a_scale_storage,
             candle_dtype_for_deepgemm(self.a_scale_layout.dtype),
             a_scale_storage_layout.start_offset(),
-            &stream,
+            stream,
             "a_scale",
         )?;
         let (b_storage, b_layout) = b.storage_and_layout();
@@ -177,7 +200,7 @@ impl Fp8GemmNtWorkspace {
             &b_storage,
             CandleDType::F8E4M3,
             b_layout.start_offset(),
-            &stream,
+            stream,
             "b",
         )?;
         let (b_scale_storage, b_scale_layout) = self.b_scale_transformed.storage_and_layout();
@@ -188,7 +211,7 @@ impl Fp8GemmNtWorkspace {
                 Arch::Sm100 => CandleDType::I32,
             },
             b_scale_layout.start_offset(),
-            &stream,
+            stream,
             "b_scale",
         )?;
         let (d_storage, d_layout) = self.output.storage_and_layout();
@@ -196,7 +219,7 @@ impl Fp8GemmNtWorkspace {
             &d_storage,
             CandleDType::BF16,
             d_layout.start_offset(),
-            &stream,
+            stream,
             "d",
         )?;
         let launch = Fp8GemmNtLaunch {
