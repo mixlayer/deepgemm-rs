@@ -13,7 +13,7 @@ pub mod tensor;
 pub use deepgemm;
 
 pub use error::{Error, Result};
-pub use gemm::fp8_gemm_nt;
+pub use gemm::{fp8_gemm_nt, fp8_gemm_nt_prepared_scales, prepare_fp8_gemm_scale};
 pub use mqa::{
     MqaLogitsConfig, PagedMqaLogitsConfig, PagedMqaLogitsPlan, fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits, paged_mqa_logits_plan,

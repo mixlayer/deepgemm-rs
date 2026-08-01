@@ -353,6 +353,64 @@ std::string transpose_and_pack_fp32_code(int num_threads, int block_mn, int sf_k
   return code.str();
 }
 
+std::string broadcast_transpose_fp32_code() {
+  return R"(
+#include <cstdint>
+
+extern "C" __global__ void broadcast_transpose_fp32(
+    const float* scale, float* transformed, uint32_t mn, uint32_t sf_k,
+    uint32_t gran_mn, uint32_t aligned_mn) {
+  const uint64_t linear =
+      static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const uint64_t count = static_cast<uint64_t>(mn) * sf_k;
+  if (linear >= count) {
+    return;
+  }
+  const uint32_t mn_idx = static_cast<uint32_t>(linear / sf_k);
+  const uint32_t k_idx = static_cast<uint32_t>(linear % sf_k);
+  transformed[static_cast<uint64_t>(k_idx) * aligned_mn + mn_idx] =
+      scale[static_cast<uint64_t>(mn_idx / gran_mn) * sf_k + k_idx];
+}
+)";
+}
+
+std::string broadcast_transpose_and_pack_fp32_code() {
+  return R"(
+#include <cstdint>
+
+extern "C" __global__ void broadcast_transpose_and_pack_fp32_into_ue8m0(
+    const float* scale, uint32_t* transformed, uint32_t mn, uint32_t sf_k,
+    uint32_t packed_sf_k, uint32_t gran_mn, uint32_t aligned_mn) {
+  const uint64_t linear =
+      static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const uint64_t count = static_cast<uint64_t>(mn) * packed_sf_k;
+  if (linear >= count) {
+    return;
+  }
+  const uint32_t mn_idx = static_cast<uint32_t>(linear / packed_sf_k);
+  const uint32_t packed_k_idx = static_cast<uint32_t>(linear % packed_sf_k);
+  const uint64_t input_row = static_cast<uint64_t>(mn_idx / gran_mn) * sf_k;
+
+  uint32_t packed = 0;
+#pragma unroll
+  for (uint32_t lane = 0; lane < 4; ++lane) {
+    const uint32_t k_idx = packed_k_idx * 4 + lane;
+    if (k_idx < sf_k) {
+      const uint32_t bits =
+          reinterpret_cast<const uint32_t*>(scale)[input_row + k_idx];
+      if ((bits & 0x807fffffu) != 0 || bits == 0 ||
+          (bits & 0x7f800000u) == 0x7f800000u) {
+        asm("trap;");
+      }
+      packed |= (bits >> 23u) << (lane * 8u);
+    }
+  }
+  transformed[static_cast<uint64_t>(packed_k_idx) * aligned_mn + mn_idx] =
+      packed;
+}
+)";
+}
+
 StorageConfig sm90_storage_config(const GemmLayout& layout) {
   StorageConfig storage;
   storage.load_block_m = layout.block_m;
@@ -978,13 +1036,18 @@ void launch_fp8_gemm_transform_scale(
   require_contiguous_2d(params.scale, DEEPGEMM_DTYPE_F32, "scale");
   const int64_t mn = params.mn;
   const int64_t k = params.k;
+  const int64_t gran_mn_i64 = params.gran_mn;
   const int64_t gran_k_i64 = params.gran_k;
-  if (mn <= 0 || k <= 0 || gran_k_i64 <= 0 || gran_k_i64 > INT32_MAX) {
-    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "mn, k, and gran_k must be positive");
+  if (mn <= 0 || k <= 0 || gran_mn_i64 <= 0 || gran_mn_i64 > INT32_MAX ||
+      gran_k_i64 <= 0 || gran_k_i64 > INT32_MAX) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "mn, k, gran_mn, and gran_k must be positive");
   }
+  const int gran_mn = static_cast<int>(gran_mn_i64);
   const int gran_k = static_cast<int>(gran_k_i64);
   const int64_t sf_k = ceil_div_i64(k, gran_k);
-  require_shape_2d(params.scale, mn, sf_k, "scale");
+  require_shape_2d(params.scale, ceil_div_i64(mn, gran_mn), sf_k, "scale");
 
   if (params.transformed.dtype != DEEPGEMM_DTYPE_F32 &&
       params.transformed.dtype != DEEPGEMM_DTYPE_PACKED_UE8M0) {
@@ -1000,6 +1063,63 @@ void launch_fp8_gemm_transform_scale(
 
   if (sf_k <= 0 || sf_k > 512) {
     throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "scale K blocks must be between 1 and 512");
+  }
+
+  if (gran_mn != 1) {
+    constexpr int num_threads = 256;
+    if (mn > INT64_MAX / sf_k) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "broadcast scale element count overflowed");
+    }
+    const int aligned_mn = tma_aligned_mn(mn, params.transformed.dtype, "transformed");
+    const auto mn_arg = static_cast<uint32_t>(mn);
+    const auto sf_k_arg = static_cast<uint32_t>(sf_k);
+    const auto gran_mn_arg = static_cast<uint32_t>(gran_mn);
+    const auto aligned_mn_arg = static_cast<uint32_t>(aligned_mn);
+    auto* scale = const_cast<float*>(reinterpret_cast<const float*>(params.scale.data));
+
+    LaunchArgs launch_args;
+    launch_args.num_threads = num_threads;
+
+    if (params.transformed.dtype == DEEPGEMM_DTYPE_F32) {
+      const int64_t count = mn * sf_k;
+      launch_args.grid_x = as_i32(ceil_div_i64(count, num_threads), "broadcast grid x");
+      const auto runtime = build_kernel(
+          "broadcast_transpose_fp32",
+          broadcast_transpose_fp32_code());
+      auto* transformed = reinterpret_cast<float*>(params.transformed.data);
+      launch_kernel(
+          runtime,
+          reinterpret_cast<CUstream>(params.stream),
+          launch_args,
+          scale,
+          transformed,
+          mn_arg,
+          sf_k_arg,
+          gran_mn_arg,
+          aligned_mn_arg);
+      return;
+    }
+
+    const int64_t packed_sf_k = ceil_div_i64(sf_k, 4);
+    const int64_t count = mn * packed_sf_k;
+    launch_args.grid_x = as_i32(ceil_div_i64(count, num_threads), "broadcast pack grid x");
+    const auto runtime = build_kernel(
+        "broadcast_transpose_and_pack_fp32_into_ue8m0",
+        broadcast_transpose_and_pack_fp32_code());
+    auto* transformed = reinterpret_cast<uint32_t*>(params.transformed.data);
+    const auto packed_sf_k_arg = static_cast<uint32_t>(packed_sf_k);
+    launch_kernel(
+        runtime,
+        reinterpret_cast<CUstream>(params.stream),
+        launch_args,
+        scale,
+        transformed,
+        mn_arg,
+        sf_k_arg,
+        packed_sf_k_arg,
+        gran_mn_arg,
+        aligned_mn_arg);
+    return;
   }
 
   if (params.transformed.dtype == DEEPGEMM_DTYPE_F32) {

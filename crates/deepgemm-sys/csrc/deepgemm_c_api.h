@@ -140,6 +140,7 @@ typedef struct deepgemm_fp8_gemm_scale_transform_params_t {
   deepgemm_tensor_mut_t transformed;
   int64_t mn;
   int64_t k;
+  int64_t gran_mn;
   int64_t gran_k;
   deepgemm_cuda_stream_t stream;
 } deepgemm_fp8_gemm_scale_transform_params_t;

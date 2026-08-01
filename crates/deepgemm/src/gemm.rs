@@ -6,13 +6,15 @@ use crate::{
 /// Shape and dtype contract for transforming FP8 GEMM scales.
 ///
 /// Tensor contract:
-/// - `scale`: `F32 [mn, ceil(k / gran_k)]`, row-major contiguous.
+/// - `scale`: `F32 [ceil(mn / gran_mn), ceil(k / gran_k)]`, row-major
+///   contiguous.
 /// - `transformed`: either `F32 [mn, ceil(k / gran_k)]` or packed UE8M0
 ///   `[mn, ceil(k / (gran_k * 4))]`, with strides `[1, aligned_mn]`.
 ///   `aligned_mn` is the TMA alignment of `mn` for the transformed dtype.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Fp8GemmScaleTransformSpec {
-    /// Raw FP32 scale tensor, `F32 [mn, ceil(k / gran_k)]`.
+    /// Raw FP32 scale tensor,
+    /// `F32 [ceil(mn / gran_mn), ceil(k / gran_k)]`.
     pub scale: TensorSpec<2>,
     /// Transformed scale tensor consumed by GEMM kernels.
     pub transformed: TensorSpec<2>,
@@ -20,6 +22,8 @@ pub struct Fp8GemmScaleTransformSpec {
     pub mn: usize,
     /// GEMM K dimension before scale blocking.
     pub k: usize,
+    /// MN-block granularity represented by one raw FP32 scale row.
+    pub gran_mn: usize,
     /// K-block granularity represented by one raw FP32 scale.
     pub gran_k: usize,
 }
@@ -60,7 +64,8 @@ pub struct Fp8GemmNtSpec {
 /// Raw launch arguments for transforming FP8 GEMM scales.
 #[derive(Debug, Copy, Clone)]
 pub struct Fp8GemmScaleTransformLaunch {
-    /// Raw FP32 scale tensor: `F32 [mn, ceil(k / gran_k)]`.
+    /// Raw FP32 scale tensor:
+    /// `F32 [ceil(mn / gran_mn), ceil(k / gran_k)]`.
     pub scale: TensorArg<2>,
     /// Transformed scale tensor. Dtype and dims are defined by
     /// `fp8_gemm_scale_layout(mn, k, gran_k, transformed_dtype)`.
@@ -69,6 +74,8 @@ pub struct Fp8GemmScaleTransformLaunch {
     pub mn: usize,
     /// GEMM K dimension before scale blocking.
     pub k: usize,
+    /// MN-block granularity represented by one raw FP32 scale row.
+    pub gran_mn: usize,
     /// K-block granularity represented by one raw FP32 scale.
     pub gran_k: usize,
     /// CUDA stream for the launch.
@@ -83,6 +90,7 @@ impl Fp8GemmScaleTransformLaunch {
             transformed: self.transformed.spec,
             mn: self.mn,
             k: self.k,
+            gran_mn: self.gran_mn,
             gran_k: self.gran_k,
         }
     }
@@ -182,6 +190,7 @@ pub unsafe fn fp8_gemm_transform_scale(params: &Fp8GemmScaleTransformLaunch) -> 
         transformed: params.transformed.to_raw()?,
         mn: usize_to_i64(params.mn, "mn")?,
         k: usize_to_i64(params.k, "k")?,
+        gran_mn: usize_to_i64(params.gran_mn, "gran_mn")?,
         gran_k: usize_to_i64(params.gran_k, "gran_k")?,
         stream: params.stream,
     };
@@ -227,12 +236,16 @@ struct GemmDims {
 fn validate_fp8_gemm_scale_transform_spec(spec: &Fp8GemmScaleTransformSpec) -> Result<()> {
     require_positive(spec.mn, "mn")?;
     require_positive(spec.k, "k")?;
+    require_positive(spec.gran_mn, "gran_mn")?;
     require_positive(spec.gran_k, "gran_k")?;
     require_contiguous(&spec.scale, "scale")?;
     require_dtype(&spec.scale, DType::F32, "scale")?;
     require_shape(
         spec.scale.shape,
-        [spec.mn, ceil_div(spec.k, spec.gran_k)?],
+        [
+            ceil_div(spec.mn, spec.gran_mn)?,
+            ceil_div(spec.k, spec.gran_k)?,
+        ],
         "scale",
     )?;
     let expected =
@@ -391,6 +404,39 @@ mod tests {
         assert_eq!(layout.allocation_shape, [14, 4100]);
         assert_eq!(layout.strides, [1, 4100]);
         assert_eq!(layout.element_count, 14 * 4100);
+    }
+
+    #[test]
+    fn scale_transform_accepts_blocked_mn_input() {
+        let spec = Fp8GemmScaleTransformSpec {
+            scale: TensorSpec::contiguous(DType::F32, [17, 56]),
+            transformed: fp8_gemm_scale_layout(2112, 7168, 128, DType::PackedUe8M0)
+                .unwrap()
+                .logical_spec(),
+            mn: 2112,
+            k: 7168,
+            gran_mn: 128,
+            gran_k: 128,
+        };
+        assert!(validate_fp8_gemm_scale_transform_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn scale_transform_rejects_wrong_blocked_mn_rows() {
+        let spec = Fp8GemmScaleTransformSpec {
+            scale: TensorSpec::contiguous(DType::F32, [2112, 56]),
+            transformed: fp8_gemm_scale_layout(2112, 7168, 128, DType::PackedUe8M0)
+                .unwrap()
+                .logical_spec(),
+            mn: 2112,
+            k: 7168,
+            gran_mn: 128,
+            gran_k: 128,
+        };
+        assert!(matches!(
+            validate_fp8_gemm_scale_transform_spec(&spec),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]
