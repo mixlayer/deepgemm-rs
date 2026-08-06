@@ -27,6 +27,26 @@ typedef enum deepgemm_dtype_t {
   DEEPGEMM_DTYPE_U8 = 7,
 } deepgemm_dtype_t;
 
+typedef enum deepgemm_kernel_materialization_source_t {
+  DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_PROCESS_CACHE = 0,
+  DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_DISK_CUBIN = 1,
+  DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_JIT_COMPILE = 2,
+} deepgemm_kernel_materialization_source_t;
+
+typedef enum deepgemm_kernel_materialization_phase_t {
+  DEEPGEMM_KERNEL_MATERIALIZATION_PHASE_START = 0,
+  DEEPGEMM_KERNEL_MATERIALIZATION_PHASE_FINISH = 1,
+} deepgemm_kernel_materialization_phase_t;
+
+typedef void (*deepgemm_kernel_materialization_hook_t)(
+  const char* kernel_name,
+  deepgemm_kernel_materialization_source_t source,
+  deepgemm_kernel_materialization_phase_t phase,
+  bool success,
+  bool has_duration,
+  uint64_t duration_ns
+);
+
 typedef void* deepgemm_cuda_stream_t;
 
 typedef struct deepgemm_tensor_t {
@@ -174,6 +194,10 @@ deepgemm_status_t deepgemm_set_num_sms(
 
 deepgemm_status_t deepgemm_set_pdl(
   bool enabled
+);
+
+deepgemm_status_t deepgemm_set_kernel_materialization_hook(
+  deepgemm_kernel_materialization_hook_t hook
 );
 
 deepgemm_status_t deepgemm_mqa_logits_layout(

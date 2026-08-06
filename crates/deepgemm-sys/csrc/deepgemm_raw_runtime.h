@@ -64,6 +64,7 @@ int effective_num_sms();
 void set_num_sms_override(int num_sms);
 void set_pdl(bool enabled);
 bool pdl_enabled();
+void set_kernel_materialization_hook(deepgemm_kernel_materialization_hook_t hook);
 
 std::shared_ptr<KernelRuntime> build_kernel(
     const std::string& name,

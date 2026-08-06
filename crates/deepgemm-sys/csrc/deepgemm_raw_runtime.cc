@@ -1,5 +1,6 @@
 #include "deepgemm_raw_runtime.h"
 
+#include <chrono>
 #include <dlfcn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -26,6 +27,8 @@ std::string g_cutlass_include_path;
 std::string g_cutlass_util_include_path;
 int g_num_sms_override = 0;
 bool g_pdl_enabled = false;
+std::mutex g_kernel_materialization_hook_mutex;
+deepgemm_kernel_materialization_hook_t g_kernel_materialization_hook = nullptr;
 std::unordered_map<std::string, std::shared_ptr<KernelRuntime>> g_kernel_cache;
 
 struct CompilerConfig {
@@ -34,6 +37,73 @@ struct CompilerConfig {
 };
 
 std::optional<CompilerConfig> g_compiler_config_cache;
+
+void emit_kernel_materialization_event(
+    const char* kernel_name,
+    deepgemm_kernel_materialization_source_t source,
+    deepgemm_kernel_materialization_phase_t phase,
+    bool success,
+    bool has_duration,
+    uint64_t duration_ns) {
+  deepgemm_kernel_materialization_hook_t hook = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_kernel_materialization_hook_mutex);
+    hook = g_kernel_materialization_hook;
+  }
+  if (hook == nullptr) {
+    return;
+  }
+  hook(kernel_name, source, phase, success, has_duration, duration_ns);
+}
+
+class KernelMaterializationScope final {
+ public:
+  KernelMaterializationScope(
+      std::string kernel_name,
+      deepgemm_kernel_materialization_source_t source)
+      : kernel_name_(std::move(kernel_name)),
+        source_(source),
+        start_(std::chrono::steady_clock::now()) {
+    emit_kernel_materialization_event(
+        kernel_name_.c_str(),
+        source_,
+        DEEPGEMM_KERNEL_MATERIALIZATION_PHASE_START,
+        true,
+        false,
+        0);
+  }
+
+  ~KernelMaterializationScope() {
+    finish(false);
+  }
+
+  void finish_success() {
+    finish(true);
+  }
+
+ private:
+  void finish(bool success) {
+    if (finished_) {
+      return;
+    }
+    finished_ = true;
+    const auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - start_)
+                                 .count();
+    emit_kernel_materialization_event(
+        kernel_name_.c_str(),
+        source_,
+        DEEPGEMM_KERNEL_MATERIALIZATION_PHASE_FINISH,
+        success,
+        true,
+        static_cast<uint64_t>(duration_ns));
+  }
+
+  std::string kernel_name_;
+  deepgemm_kernel_materialization_source_t source_;
+  std::chrono::steady_clock::time_point start_;
+  bool finished_ = false;
+};
 
 void* cuda_driver_handle() {
   static void* handle = nullptr;
@@ -259,19 +329,34 @@ void write_file(const std::filesystem::path& path, const std::string& contents) 
 }
 
 std::shared_ptr<KernelRuntime> load_cached_kernel(
+    const std::string& name,
     const std::string& cache_key,
     const std::filesystem::path& dir_path) {
-  std::lock_guard<std::mutex> lock(g_runtime_mutex);
-  auto entry = g_kernel_cache.find(cache_key);
-  if (entry != g_kernel_cache.end()) {
-    return entry->second;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mutex);
+    auto entry = g_kernel_cache.find(cache_key);
+    if (entry != g_kernel_cache.end()) {
+      auto runtime = entry->second;
+      KernelMaterializationScope scope(
+          name,
+          DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_PROCESS_CACHE);
+      scope.finish_success();
+      return runtime;
+    }
   }
   if (!std::filesystem::exists(dir_path / "kernel.cubin")) {
     return nullptr;
   }
 
+  KernelMaterializationScope scope(
+      name,
+      DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_DISK_CUBIN);
   auto runtime = std::make_shared<KernelRuntime>((dir_path / "kernel.cubin").string());
-  g_kernel_cache[cache_key] = runtime;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mutex);
+    g_kernel_cache[cache_key] = runtime;
+  }
+  scope.finish_success();
   return runtime;
 }
 
@@ -454,6 +539,11 @@ bool pdl_enabled() {
   return g_pdl_enabled;
 }
 
+void set_kernel_materialization_hook(deepgemm_kernel_materialization_hook_t hook) {
+  std::lock_guard<std::mutex> lock(g_kernel_materialization_hook_mutex);
+  g_kernel_materialization_hook = hook;
+}
+
 std::shared_ptr<KernelRuntime> build_kernel(
     const std::string& name,
     const std::string& code) {
@@ -465,10 +555,13 @@ std::shared_ptr<KernelRuntime> build_kernel(
   const auto cache_key = name + "$$" + config.nvcc.string() + "$$" + config.flags + "$$" + code;
   const auto hash = hex_u64(fnv1a64(cache_key));
   const auto dir_path = cache_root() / "cache" / ("kernel." + name + "." + hash);
-  if (auto runtime = load_cached_kernel(cache_key, dir_path)) {
+  if (auto runtime = load_cached_kernel(name, cache_key, dir_path)) {
     return runtime;
   }
 
+  KernelMaterializationScope scope(
+      name,
+      DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_JIT_COMPILE);
   const auto tmp_root = cache_root() / "tmp";
   std::filesystem::create_directories(tmp_root);
   const auto tmp_dir = tmp_root / (name + "." + std::to_string(getpid()) + "." + hash);
@@ -511,6 +604,7 @@ std::shared_ptr<KernelRuntime> build_kernel(
     std::lock_guard<std::mutex> lock(g_runtime_mutex);
     g_kernel_cache[cache_key] = runtime;
   }
+  scope.finish_success();
   return runtime;
 }
 

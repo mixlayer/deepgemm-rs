@@ -223,6 +223,12 @@ extern "C" deepgemm_status_t deepgemm_set_pdl(bool enabled) {
   });
 }
 
+extern "C" deepgemm_status_t deepgemm_set_kernel_materialization_hook(
+    deepgemm_kernel_materialization_hook_t hook) {
+  deepgemm_rs::set_kernel_materialization_hook(hook);
+  return clear_error();
+}
+
 extern "C" deepgemm_status_t deepgemm_mqa_logits_layout(
     const deepgemm_mqa_logits_layout_params_t* params,
     deepgemm_tensor_layout_2d_t* out) {
