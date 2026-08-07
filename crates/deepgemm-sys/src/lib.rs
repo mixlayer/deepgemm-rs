@@ -175,6 +175,7 @@ pub struct deepgemm_fp8_gemm_scale_transform_params_t {
     pub transformed: deepgemm_tensor_mut_t,
     pub mn: i64,
     pub k: i64,
+    pub gran_mn: i64,
     pub gran_k: i64,
     pub stream: deepgemm_cuda_stream_t,
 }
