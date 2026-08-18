@@ -3,6 +3,18 @@ use crate::{
     tensor::{i64_to_isize, i64_to_usize, require_contiguous, require_dtype, usize_to_i64},
 };
 
+/// Returns whether Hopper has a native paged-MQA kernel for `next_n`.
+pub const fn sm90_native_next_n(next_n: usize) -> bool {
+    matches!(next_n, 1 | 2 | 4)
+}
+
+/// Returns the number of Hopper CTAs that multicast each paged-MQA KV tile.
+///
+/// Callers should first use [`sm90_native_next_n`] to reject unsupported widths.
+pub const fn sm90_num_kv_multicast(next_n: usize) -> usize {
+    if next_n == 4 { 2 } else { 1 }
+}
+
 /// Shape and dtype contract for `fp8_fp4_mqa_logits`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct MqaLogitsSpec {
@@ -36,7 +48,7 @@ pub struct PagedMqaLogitsMetadataSpec {
     pub context_lens: TensorSpec<2>,
     /// Optional SM100 varlen indices: `[batch_size]`, `i32`.
     pub indices: Option<TensorSpec<1>>,
-    /// KV page size. SM90 supports `64`; SM100 supports `32` or `64`.
+    /// KV page size. SM90 and SM100 support `32` or `64`.
     pub block_kv: usize,
     /// Number of SMs used by the launch.
     pub num_sms: usize,
@@ -60,7 +72,8 @@ pub struct PagedMqaLogitsSpec {
     pub context_lens: TensorSpec<2>,
     /// Block table: `[batch_size, max_block_len]`, `i32`.
     pub block_table: TensorSpec<2>,
-    /// Schedule metadata: `[num_sms + 1, 2]`, `i32`.
+    /// Schedule metadata: `[schedule_slots + 1, 2]`, `i32`. `schedule_slots` is
+    /// `num_sms / 2` for SM90 `next_n == 4`, and `num_sms` otherwise.
     pub schedule_meta: TensorSpec<2>,
     /// Optional SM100 varlen indices: `[batch_size]`, `i32`.
     pub indices: Option<TensorSpec<1>>,
@@ -217,6 +230,13 @@ pub fn paged_mqa_logits_metadata_layout(
 ) -> Result<TensorLayout2D> {
     validate_paged_metadata_spec(spec, arch)?;
     let params = deepgemm_sys::deepgemm_paged_mqa_logits_metadata_layout_params_t {
+        compute_capability_major: match arch {
+            Arch::Sm90 => 9,
+            Arch::Sm100 => 10,
+        },
+        batch_size: usize_to_i64(spec.context_lens.shape[0], "batch_size")?,
+        next_n: usize_to_i64(spec.context_lens.shape[1], "next_n")?,
+        block_kv: usize_to_i64(spec.block_kv, "block_kv")?,
         num_sms: usize_to_i64(spec.num_sms, "num_sms")?,
     };
     call_layout(|out| {
@@ -451,6 +471,7 @@ fn validate_paged_metadata_spec(spec: &PagedMqaLogitsMetadataSpec, arch: Arch) -
     let next_n = spec.context_lens.shape[1];
     validate_block_kv(arch, spec.block_kv)?;
     require_positive(spec.num_sms, "num_sms")?;
+    paged_schedule_slots(arch, next_n, spec.num_sms)?;
 
     if let Some(indices) = spec.indices {
         if arch != Arch::Sm100 || next_n != 1 {
@@ -479,6 +500,9 @@ fn validate_paged_mqa_logits_spec(spec: &PagedMqaLogitsSpec, arch: Arch) -> Resu
     let num_heads = spec.q.shape[2];
     let head_dim = logical_head_dim(spec.q.shape[3], is_fp4)?;
     let block_kv = spec.fused_kv_cache.shape[1];
+
+    validate_block_kv(arch, block_kv)?;
+    let schedule_slots = paged_schedule_slots(arch, next_n, spec.num_sms)?;
 
     require_contiguous(&spec.q, "q")?;
     require_dtype(
@@ -540,7 +564,7 @@ fn validate_paged_mqa_logits_spec(spec: &PagedMqaLogitsSpec, arch: Arch) -> Resu
         ));
     }
     require_dtype(&spec.block_table, DType::I32, "block_table")?;
-    require_2d_i32(spec.schedule_meta, [spec.num_sms + 1, 2], "schedule_meta")?;
+    require_2d_i32(spec.schedule_meta, [schedule_slots + 1, 2], "schedule_meta")?;
 
     if let Some(indices) = spec.indices {
         if arch != Arch::Sm100 || next_n != 1 {
@@ -551,15 +575,27 @@ fn validate_paged_mqa_logits_spec(spec: &PagedMqaLogitsSpec, arch: Arch) -> Resu
         require_i32_vector(indices, batch_size, "indices")?;
     }
 
-    validate_block_kv(arch, block_kv)?;
     require_arch_support(arch, is_fp4, num_heads, head_dim, true)?;
-    if arch == Arch::Sm90 && next_n != 1 && next_n != 2 {
-        return Err(Error::InvalidArgument(
-            "SM90 paged MQA requires next_n == 1 or 2".into(),
-        ));
-    }
 
     Ok(PagedDims { batch_size, next_n })
+}
+
+fn paged_schedule_slots(arch: Arch, next_n: usize, num_sms: usize) -> Result<usize> {
+    if arch != Arch::Sm90 {
+        return Ok(num_sms);
+    }
+    if !sm90_native_next_n(next_n) {
+        return Err(Error::InvalidArgument(
+            "SM90 paged MQA requires next_n == 1, 2, or 4".into(),
+        ));
+    }
+    let num_kv_multicast = sm90_num_kv_multicast(next_n);
+    if !num_sms.is_multiple_of(num_kv_multicast) {
+        return Err(Error::InvalidArgument(
+            "SM90 next_n == 4 requires an even physical num_sms".into(),
+        ));
+    }
+    Ok(num_sms / num_kv_multicast)
 }
 
 fn require_logits_dtype(dtype: DType) -> Result<()> {
@@ -651,9 +687,9 @@ fn physical_head_dim(logical: usize, is_fp4: bool) -> usize {
 
 fn validate_block_kv(arch: Arch, block_kv: usize) -> Result<()> {
     match arch {
-        Arch::Sm90 if block_kv == 64 => Ok(()),
+        Arch::Sm90 if block_kv == 32 || block_kv == 64 => Ok(()),
         Arch::Sm90 => Err(Error::InvalidArgument(
-            "SM90 paged MQA requires block_kv == 64".into(),
+            "SM90 paged MQA requires block_kv == 32 or 64".into(),
         )),
         Arch::Sm100 if block_kv == 32 || block_kv == 64 => Ok(()),
         Arch::Sm100 => Err(Error::InvalidArgument(
@@ -729,6 +765,37 @@ mod tests {
         }
     }
 
+    fn paged_metadata_spec(next_n: usize, num_sms: usize) -> PagedMqaLogitsMetadataSpec {
+        PagedMqaLogitsMetadataSpec {
+            context_lens: TensorSpec::contiguous(DType::I32, [16, next_n]),
+            indices: None,
+            block_kv: 64,
+            num_sms,
+        }
+    }
+
+    fn paged_fp8_spec(next_n: usize, num_sms: usize, block_kv: usize) -> PagedMqaLogitsSpec {
+        let schedule_slots = if next_n == 4 && num_sms.is_multiple_of(2) {
+            num_sms / 2
+        } else {
+            num_sms
+        };
+        PagedMqaLogitsSpec {
+            q: TensorSpec::contiguous(DType::Fp8E4M3, [16, next_n, 32, 64]),
+            q_scale: None,
+            fused_kv_cache: TensorSpec::contiguous(DType::U8, [256, block_kv, 1, 68]),
+            weights: TensorSpec::contiguous(DType::F32, [16 * next_n, 32]),
+            context_lens: TensorSpec::contiguous(DType::I32, [16, next_n]),
+            block_table: TensorSpec::contiguous(DType::I32, [16, 256]),
+            schedule_meta: TensorSpec::contiguous(DType::I32, [schedule_slots + 1, 2]),
+            indices: None,
+            max_context_len: 8193,
+            clean_logits: false,
+            logits_dtype: DType::BF16,
+            num_sms,
+        }
+    }
+
     #[test]
     fn nonpaged_fp8_sm90_layout_includes_padded_allocation() {
         let layout = mqa_logits_layout(&fp8_mqa_spec(), Arch::Sm90).unwrap();
@@ -752,37 +819,62 @@ mod tests {
     }
 
     #[test]
-    fn paged_metadata_layout_is_explicit_i32() {
-        let spec = PagedMqaLogitsMetadataSpec {
-            context_lens: TensorSpec::contiguous(DType::I32, [16, 2]),
-            indices: None,
-            block_kv: 64,
-            num_sms: 132,
-        };
-        let layout = paged_mqa_logits_metadata_layout(&spec, Arch::Sm90).unwrap();
-        assert_eq!(layout.dtype, DType::I32);
-        assert_eq!(layout.logical_shape, [133, 2]);
-        assert_eq!(layout.allocation_shape, [133, 2]);
-        assert_eq!(layout.strides, [2, 1]);
-        assert_eq!(layout.element_count, 266);
+    fn paged_metadata_layout_uses_sm90_cluster_count() {
+        for (next_n, expected_rows) in [(1, 133), (2, 133), (4, 67)] {
+            let layout =
+                paged_mqa_logits_metadata_layout(&paged_metadata_spec(next_n, 132), Arch::Sm90)
+                    .unwrap();
+            assert_eq!(layout.dtype, DType::I32);
+            assert_eq!(layout.logical_shape, [expected_rows, 2]);
+            assert_eq!(layout.allocation_shape, [expected_rows, 2]);
+            assert_eq!(layout.strides, [2, 1]);
+            assert_eq!(layout.element_count, expected_rows * 2);
+        }
+    }
+
+    #[test]
+    fn sm90_native_next_n_capability_is_exact() {
+        for next_n in [1, 2, 4] {
+            assert!(sm90_native_next_n(next_n));
+            assert!(
+                paged_mqa_logits_metadata_layout(&paged_metadata_spec(next_n, 132), Arch::Sm90)
+                    .is_ok()
+            );
+            assert!(paged_mqa_logits_layout(&paged_fp8_spec(next_n, 132, 64), Arch::Sm90).is_ok());
+        }
+        for next_n in [3, 5] {
+            assert!(!sm90_native_next_n(next_n));
+            assert!(matches!(
+                paged_mqa_logits_metadata_layout(&paged_metadata_spec(next_n, 132), Arch::Sm90),
+                Err(Error::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                paged_mqa_logits_layout(&paged_fp8_spec(next_n, 132, 64), Arch::Sm90),
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn sm90_next_n_four_rejects_odd_physical_sm_count() {
+        assert!(matches!(
+            paged_mqa_logits_metadata_layout(&paged_metadata_spec(4, 131), Arch::Sm90),
+            Err(Error::InvalidArgument(message)) if message.contains("even physical num_sms")
+        ));
+        assert!(matches!(
+            paged_mqa_logits_layout(&paged_fp8_spec(4, 131, 64), Arch::Sm90),
+            Err(Error::InvalidArgument(message)) if message.contains("even physical num_sms")
+        ));
+    }
+
+    #[test]
+    fn sm90_paged_mqa_accepts_32_token_pages() {
+        assert!(paged_mqa_logits_layout(&paged_fp8_spec(4, 132, 32), Arch::Sm90).is_ok());
     }
 
     #[test]
     fn paged_fp8_layout_uses_aligned_context_width() {
-        let spec = PagedMqaLogitsSpec {
-            q: TensorSpec::contiguous(DType::Fp8E4M3, [16, 2, 32, 64]),
-            q_scale: None,
-            fused_kv_cache: TensorSpec::contiguous(DType::U8, [128, 64, 1, 68]),
-            weights: TensorSpec::contiguous(DType::F32, [32, 32]),
-            context_lens: TensorSpec::contiguous(DType::I32, [16, 2]),
-            block_table: TensorSpec::contiguous(DType::I32, [16, 128]),
-            schedule_meta: TensorSpec::contiguous(DType::I32, [133, 2]),
-            indices: None,
-            max_context_len: 8193,
-            clean_logits: false,
-            logits_dtype: DType::BF16,
-            num_sms: 132,
-        };
+        let spec = paged_fp8_spec(2, 132, 64);
         let layout = paged_mqa_logits_layout(&spec, Arch::Sm90).unwrap();
         assert_eq!(layout.dtype, DType::BF16);
         assert_eq!(layout.logical_shape, [32, 8193]);

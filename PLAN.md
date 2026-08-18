@@ -8,7 +8,7 @@ The first binding surface is the MQA logits family used by DeepGEMM's attention 
 - `get_paged_mqa_logits_metadata`
 - `fp8_fp4_paged_mqa_logits`
 
-The paged logits API requires schedule metadata shaped `[num_sms + 1, 2]`, so metadata generation is part of the initial surface.
+The paged logits API requires schedule metadata shaped `[schedule_slots + 1, 2]`, so metadata generation is part of the initial surface. `schedule_slots` is `num_sms / 2` for SM90 `next_n == 4` and `num_sms` otherwise.
 
 ## Architecture Dispatch
 
@@ -62,7 +62,7 @@ The safe Rust layer should expose helper functions for:
 
 - Required non-paged logits allocation shape and aligned row stride.
 - Required paged logits allocation shape and aligned row stride.
-- Required paged metadata length: `(num_sms + 1) * 2` `i32` elements.
+- Required paged metadata length: `(schedule_slots + 1) * 2` `i32` elements, with cluster-sized slots for SM90 `next_n == 4`.
 
 ## C ABI Surface
 
@@ -130,11 +130,11 @@ Common:
 
 - `context_lens`: `[batch_size, next_n]`, `i32`, contiguous.
 - Only 2D context lengths are in scope initially.
-- Output metadata: `[num_sms + 1, 2]`, `i32`, contiguous.
+- Output metadata: `[schedule_slots + 1, 2]`, `i32`, contiguous; `schedule_slots = num_sms / 2` for SM90 `next_n == 4` and `num_sms` otherwise.
 
 SM90:
 
-- `block_kv == 64`.
+- `block_kv == 32` or `64`.
 - No varlen `indices`.
 
 SM100:
@@ -151,7 +151,7 @@ Common:
 - `weights`: `[batch_size * next_n, num_heads]`, stride on head dimension must be 1.
 - `context_lens`: `[batch_size, next_n]`, `i32`, contiguous.
 - `block_table`: `[batch_size, max_block_len]`, `i32`, stride on block dimension must be 1.
-- `schedule_meta`: `[num_sms + 1, 2]`, `i32`, contiguous.
+- `schedule_meta`: `[schedule_slots + 1, 2]`, `i32`, contiguous; SM90 `next_n == 4` uses `num_sms / 2` scheduler slots.
 - Logits dtype: `f32` or `bf16`.
 - Logits row stride must be 1024-byte aligned and a multiple of `split_kv = 256`.
 - `clean_logits` should remain unsupported initially because upstream currently asserts against 2D context lengths when cleaning.
@@ -161,8 +161,8 @@ SM90:
 - FP8 only.
 - `num_heads`: `32` or `64`.
 - `head_dim`: `32`, `64`, or `128`.
-- `block_kv == 64`.
-- `next_n == 1` or `2`.
+- `block_kv == 32` or `64`.
+- Native `next_n == 1`, `2`, or `4`; `next_n == 4` launches two-CTA clusters and requires an even physical SM count.
 - No varlen `indices`.
 - weights dtype: `f32`.
 
