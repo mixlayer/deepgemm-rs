@@ -29,7 +29,9 @@ pub struct MqaLogitsConfig {
 /// Caller-owned paged MQA scheduler metadata.
 #[derive(Debug)]
 pub struct PagedMqaLogitsPlan {
-    /// I32 scheduler metadata shaped `[num_sms + 1, 2]`.
+    /// I32 scheduler metadata shaped `[schedule_slots + 1, 2]`. Hopper
+    /// `next_n == 4` uses `schedule_slots = num_sms / 2`; other paths use
+    /// `schedule_slots = num_sms`.
     pub schedule_meta: Tensor,
     /// KV page size used to generate `schedule_meta`.
     pub block_kv: usize,
@@ -77,9 +79,11 @@ impl Default for MqaLogitsConfig {
 /// Arguments:
 /// - `context_lens`: `I32 [batch_size, next_n]`
 /// - `indices`: optional SM100 varlen indices, `I32 [batch_size]`; requires `next_n == 1`
-/// - `block_kv`: KV page size. SM90 supports `64`; SM100 supports `32` or `64`.
+/// - `block_kv`: KV page size. SM90 and SM100 support `32` or `64`.
 ///
-/// Returns a plan containing `schedule_meta`: `I32 [num_sms + 1, 2]`.
+/// Returns a plan containing cluster-sized scheduler metadata. For SM90
+/// `next_n == 4`, its shape is `I32 [num_sms / 2 + 1, 2]`; otherwise it is
+/// `I32 [num_sms + 1, 2]`.
 pub fn paged_mqa_logits_plan(
     context_lens: &Tensor,
     indices: Option<&Tensor>,
@@ -360,7 +364,8 @@ pub fn fp8_fp4_mqa_logits(
 /// - `weights`: `F32 [batch_size * next_n, num_heads]`, or SM100 `BF16` when logits are BF16
 /// - `context_lens`: `I32 [batch_size, next_n]`
 /// - `block_table`: `I32 [batch_size, max_block_len]`
-/// - `plan.schedule_meta`: `I32 [num_sms + 1, 2]`, generated with `paged_mqa_logits_plan`
+/// - `plan.schedule_meta`: `I32 [schedule_slots + 1, 2]`, generated with
+///   `paged_mqa_logits_plan`; Hopper `next_n == 4` uses `schedule_slots = num_sms / 2`
 /// - `indices`: optional SM100 varlen indices, `I32 [batch_size]`; requires `next_n == 1`
 ///
 /// Returns a padded-stride logits view shaped `[batch_size * next_n, max_context_len]`.
@@ -819,5 +824,185 @@ fn candle_to_deepgemm_dtype(dtype: CandleDType, name: &str) -> Result<DeepGemmDT
         CandleDType::U8 => Ok(DeepGemmDType::U8),
         CandleDType::F8E4M3 => Ok(DeepGemmDType::Fp8E4M3),
         dtype => invalid_arg(format!("{name} has unsupported dtype {dtype:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use candle::Device;
+
+    use super::*;
+
+    fn init_deepgemm() -> Result<()> {
+        let root = deepgemm::source_root()
+            .to_str()
+            .ok_or_else(|| crate::Error::Tensor("DeepGEMM root is not UTF-8".into()))?;
+        let cuda_home = std::env::var("CUDA_HOME")
+            .or_else(|_| std::env::var("CUDA_PATH"))
+            .unwrap_or_else(|_| "/usr/local/cuda".to_string());
+        deepgemm::init(root, &cuda_home)?;
+        Ok(())
+    }
+
+    fn fp8_fused_kv_cache(
+        num_blocks: usize,
+        block_kv: usize,
+        head_dim: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let fp8_one = float8::F8E4M3::from_f32(1.0).to_bits();
+        let block_stride = block_kv * (head_dim + std::mem::size_of::<f32>());
+        let mut fused = vec![0u8; num_blocks * block_stride];
+        for block in 0..num_blocks {
+            let block_start = block * block_stride;
+            fused[block_start..block_start + block_kv * head_dim].fill(fp8_one);
+            let scales_start = block_start + block_kv * head_dim;
+            for token in 0..block_kv {
+                let offset = scales_start + token * std::mem::size_of::<f32>();
+                fused[offset..offset + std::mem::size_of::<f32>()]
+                    .copy_from_slice(&1.0f32.to_ne_bytes());
+            }
+        }
+        Ok(Tensor::from_vec(
+            fused,
+            (num_blocks, block_kv, 1, head_dim + 4),
+            device,
+        )?)
+    }
+
+    #[test]
+    #[ignore = "requires CUDA, SM90, and the DeepGEMM JIT toolchain"]
+    fn sm90_next_n_four_matches_flattened_launches() -> Result<()> {
+        let device = match Device::new_cuda(0) {
+            Ok(device) => device,
+            Err(_) => {
+                println!("Skipping test: no CUDA device available");
+                return Ok(());
+            }
+        };
+        init_deepgemm()?;
+        if deepgemm::device_info()?.arch()? != deepgemm::Arch::Sm90 {
+            println!("Skipping test: native next_n=4 requires SM90");
+            return Ok(());
+        }
+
+        let next_n = 4usize;
+        let head_dim = 128usize;
+        for batch_size in [1usize, 4, 16] {
+            let context_lens_values = (0..batch_size)
+                .flat_map(|request| {
+                    let delta = i32::try_from(request % 4).unwrap();
+                    [17 + delta, 29 + delta, 45 + delta, 61 + delta]
+                })
+                .collect::<Vec<_>>();
+            let context_lens =
+                Tensor::from_vec(context_lens_values.clone(), (batch_size, next_n), &device)?;
+
+            for num_heads in [32usize, 64] {
+                let q_values = (0..batch_size * next_n)
+                    .flat_map(|row| {
+                        let value = float8::F8E4M3::from_f32((row % next_n + 1) as f32);
+                        std::iter::repeat_n(value, num_heads * head_dim)
+                    })
+                    .collect::<Vec<_>>();
+                let q =
+                    Tensor::from_vec(q_values, (batch_size, next_n, num_heads, head_dim), &device)?;
+                let weights =
+                    Tensor::ones((batch_size * next_n, num_heads), CandleDType::F32, &device)?;
+
+                for block_kv in [64usize, 32] {
+                    let num_blocks = 64 / block_kv;
+                    let fused_kv_cache =
+                        fp8_fused_kv_cache(num_blocks, block_kv, head_dim, &device)?;
+                    let block_table_values = (0..batch_size)
+                        .flat_map(|_| 0..i32::try_from(num_blocks).unwrap())
+                        .collect::<Vec<_>>();
+                    let block_table =
+                        Tensor::from_vec(block_table_values, (batch_size, num_blocks), &device)?;
+                    let config = PagedMqaLogitsConfig::new(64);
+
+                    let native_plan = paged_mqa_logits_plan(&context_lens, None, block_kv)?;
+                    assert_eq!(
+                        native_plan.schedule_meta.dims()[0],
+                        native_plan.num_sms / 2 + 1
+                    );
+                    let native = fp8_fp4_paged_mqa_logits(
+                        &q,
+                        None,
+                        &fused_kv_cache,
+                        &weights,
+                        &context_lens,
+                        &block_table,
+                        &native_plan,
+                        None,
+                        config,
+                    )?;
+                    let native_values = native.to_vec2::<f32>()?;
+
+                    for position in 0..next_n {
+                        let q_value = float8::F8E4M3::from_f32((position + 1) as f32);
+                        let q_row = Tensor::from_vec(
+                            vec![q_value; batch_size * num_heads * head_dim],
+                            (batch_size, 1, num_heads, head_dim),
+                            &device,
+                        )?;
+                        let weights_row =
+                            Tensor::ones((batch_size, num_heads), CandleDType::F32, &device)?;
+                        let flat_context_lens = (0..batch_size)
+                            .map(|request| context_lens_values[request * next_n + position])
+                            .collect::<Vec<_>>();
+                        let context_row =
+                            Tensor::from_vec(flat_context_lens.clone(), (batch_size, 1), &device)?;
+                        let flat_plan = paged_mqa_logits_plan(&context_row, None, block_kv)?;
+                        let flat = fp8_fp4_paged_mqa_logits(
+                            &q_row,
+                            None,
+                            &fused_kv_cache,
+                            &weights_row,
+                            &context_row,
+                            &block_table,
+                            &flat_plan,
+                            None,
+                            config,
+                        )?;
+                        let flat_values = flat.to_vec2::<f32>()?;
+                        let expected = (position + 1) as f32 * num_heads as f32 * head_dim as f32;
+                        for (request, &context_len) in flat_context_lens.iter().enumerate() {
+                            let native_row = request * next_n + position;
+                            for col in 0..usize::try_from(context_len).unwrap() {
+                                assert_eq!(
+                                    native_values[native_row][col],
+                                    flat_values[request][col]
+                                );
+                                assert_eq!(flat_values[request][col], expected);
+                            }
+                        }
+                    }
+
+                    // Repeated launches catch cluster scheduler and barrier races.
+                    for _ in 0..5 {
+                        let repeated = fp8_fp4_paged_mqa_logits(
+                            &q,
+                            None,
+                            &fused_kv_cache,
+                            &weights,
+                            &context_lens,
+                            &block_table,
+                            &native_plan,
+                            None,
+                            config,
+                        )?
+                        .to_vec2::<f32>()?;
+                        for (row, &context_len) in context_lens_values.iter().enumerate() {
+                            assert_eq!(
+                                &repeated[row][..usize::try_from(context_len).unwrap()],
+                                &native_values[row][..usize::try_from(context_len).unwrap()]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

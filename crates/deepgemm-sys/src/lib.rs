@@ -99,6 +99,10 @@ pub struct deepgemm_paged_mqa_logits_layout_params_t {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct deepgemm_paged_mqa_logits_metadata_layout_params_t {
+    pub compute_capability_major: i32,
+    pub batch_size: i64,
+    pub next_n: i64,
+    pub block_kv: i64,
     pub num_sms: i64,
 }
 

@@ -29,7 +29,7 @@ pub use mqa::{
     MqaLogitsLaunch, MqaLogitsSpec, PagedMqaLogitsLaunch, PagedMqaLogitsMetadataLaunch,
     PagedMqaLogitsMetadataSpec, PagedMqaLogitsSpec, fp8_fp4_mqa_logits, fp8_fp4_paged_mqa_logits,
     logits_layout_from_sys, mqa_logits_layout, paged_mqa_logits_layout, paged_mqa_logits_metadata,
-    paged_mqa_logits_metadata_layout,
+    paged_mqa_logits_metadata_layout, sm90_native_next_n, sm90_num_kv_multicast,
 };
 pub use runtime::{DeviceInfo, device_info, init, num_sms, set_num_sms, set_pdl};
 pub use source::{SourceLayout, source_layout, source_root};

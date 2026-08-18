@@ -66,6 +66,10 @@ The default source root is the vendored submodule:
 crates/deepgemm-sys/vendor/DeepGEMM
 ```
 
+The submodule is pinned to DeepGEMM `nv_dev` revision
+`8b1392b978f5a03c828dd1711090d7fb50958b8a`; it does not follow the moving
+branch head.
+
 Initialize it with nested submodules:
 
 ```bash
@@ -128,7 +132,19 @@ This layer accepts Candle CUDA tensors, extracts stream-safe CUDA pointers, maps
 | Mega MoE | Planned | Planned | No | No | Requires additional symmetric-memory and multi-rank work |
 | HyperConnection | Planned | Planned | No | No | Not in current binding scope |
 
-Smoke-tested means a native CUDA launch completed on the available SM90 GH200 development machine. Numerical reference tests are still planned.
+Smoke-tested means a native CUDA launch completed on the available SM90 GH200 development machine. The ignored-by-default SM90 `next_n=4` regression compares native output with four flattened `next_n=1` launches for batch sizes `1`, `4`, and `16`, head counts `32` and `64`, both supported page sizes, and varying per-position context lengths; broader numerical coverage is still planned.
+
+SM90 paged-MQA/indexer logits support `next_n` exactly in `{1, 2, 4}` and
+`block_kv` in `{32, 64}`. `next_n=4` uses the native two-CTA multicast path:
+the physical grid still contains `num_sms` CTAs, while scheduler metadata has
+`num_sms / 2` slots. An odd SM-count override is rejected. SM90 `next_n=3` and
+values above four remain unsupported; higher-level callers may partition wider
+verification blocks (for example, `6` as `4 + 2`).
+
+The raw metadata-layout ABI now takes the architecture major, batch size,
+`next_n`, `block_kv`, and the physical SM count so it can derive cluster-sized
+metadata. The safe Rust and Candle entry points retain their existing spec/plan
+shape and derive this internally.
 
 ## Development
 
@@ -138,6 +154,14 @@ Common checks:
 cargo fmt --all --check
 cargo check --workspace
 cargo test --workspace
+```
+
+On an SM90 GPU, run the clustered correctness regression with:
+
+```bash
+cargo test -p candle-deepgemm \
+  mqa::tests::sm90_next_n_four_matches_flattened_launches \
+  -- --ignored --nocapture
 ```
 
 Useful environment variables:

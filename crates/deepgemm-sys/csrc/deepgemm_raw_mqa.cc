@@ -29,6 +29,27 @@ int as_i32(int64_t value, const char* name) {
   return static_cast<int>(value);
 }
 
+int64_t paged_schedule_slots(
+    int compute_capability_major,
+    int64_t next_n,
+    int64_t num_sms) {
+  if (compute_capability_major != 9) {
+    return num_sms;
+  }
+  if (!sm90_native_next_n(next_n)) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "SM90 paged MQA requires next_n == 1, 2, or 4");
+  }
+  const int64_t num_kv_multicast = sm90_num_kv_multicast(next_n);
+  if (num_sms % num_kv_multicast != 0) {
+    throw_status(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "SM90 next_n == 4 requires an even physical num_sms");
+  }
+  return num_sms / num_kv_multicast;
+}
+
 void require_tensor_rank(
     const deepgemm_tensor_t& tensor,
     uint32_t rank,
@@ -153,19 +174,23 @@ void require_logits_output(
 
 void require_schedule_meta(
     const deepgemm_tensor_mut_t& tensor,
-    int64_t num_sms) {
+    int64_t schedule_slots) {
   require_tensor_mut_rank(tensor, 2, "schedule_meta");
   require_dtype(tensor.dtype, DEEPGEMM_DTYPE_I32, "schedule_meta");
-  if (tensor.shape[0] != num_sms + 1 || tensor.shape[1] != 2 ||
+  if (tensor.shape[0] != schedule_slots + 1 || tensor.shape[1] != 2 ||
       tensor.stride[0] != 2 || tensor.stride[1] != 1) {
     std::ostringstream message;
-    message << "schedule_meta must be contiguous i32 [" << (num_sms + 1) << ", 2]";
+    message << "schedule_meta must be contiguous i32 [" << (schedule_slots + 1) << ", 2]";
     throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, message.str());
   }
 }
 
 std::string bool_literal(bool value) {
   return value ? "true" : "false";
+}
+
+const char* mqa_qk_dtype_name(bool is_fp4) {
+  return is_fp4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t";
 }
 
 int64_t align_i64(int64_t value, int64_t alignment) {
@@ -238,13 +263,14 @@ std::string sm100_mqa_logits_code(
       << "using namespace deep_gemm;\n\n"
       << "static void __instantiate_kernel() {\n"
       << "    auto ptr = reinterpret_cast<void*>(&sm100_mqa_logits<\n"
-      << "        " << bool_literal(is_fp4) << ",\n"
       << "        " << num_heads << ", " << head_dim << ",\n"
-      << "        " << bool_literal(is_compressed_logits) << ",\n"
+      << "        " << bool_literal(is_fp4) << ", "
+      << bool_literal(is_compressed_logits) << ",\n"
       << "        " << block_q << ", " << split_kv << ",\n"
       << "        " << num_q_stages << ", " << num_kv_stages << ",\n"
       << "        " << num_sms << ",\n"
       << "        " << num_specialized_threads << ", " << num_math_threads << ",\n"
+      << "        " << mqa_qk_dtype_name(is_fp4) << ",\n"
       << "        " << kernel_dtype_name(logits_dtype) << ",\n"
       << "        " << (weights_dtype == DEEPGEMM_DTYPE_BF16 ? "cutlass::bfloat16_t" : "float") << "\n"
       << "    >);\n"
@@ -273,7 +299,7 @@ std::string clean_logits_code(
 std::string sm90_metadata_code(
     int aligned_batch_size,
     int split_kv,
-    int num_sms,
+    int num_clusters,
     bool is_varlen) {
   std::ostringstream code;
   code
@@ -281,7 +307,7 @@ std::string sm90_metadata_code(
       << "using namespace deep_gemm;\n\n"
       << "static void __instantiate_kernel() {\n"
       << "    auto ptr = reinterpret_cast<void*>(&sched::sm90_paged_mqa_logits_metadata<\n"
-      << "        " << aligned_batch_size << ", " << split_kv << ", " << num_sms << ", "
+      << "        " << aligned_batch_size << ", " << split_kv << ", " << num_clusters << ", "
       << bool_literal(is_varlen) << "\n"
       << "    >);\n"
       << "};\n";
@@ -319,6 +345,7 @@ std::string sm90_paged_mqa_logits_code(
     int split_kv,
     int num_specialized_threads,
     int num_math_threads,
+    int num_kv_multicast,
     deepgemm_dtype_t logits_dtype) {
   std::ostringstream code;
   code
@@ -333,6 +360,7 @@ std::string sm90_paged_mqa_logits_code(
       << "        " << num_q_stages << ", " << num_kv_stages << ",\n"
       << "        " << split_kv << ",\n"
       << "        " << num_specialized_threads << ", " << num_math_threads << ",\n"
+      << "        " << num_kv_multicast << ",\n"
       << "        " << kernel_dtype_name(logits_dtype) << "\n"
       << "    >);\n"
       << "};\n";
@@ -361,14 +389,15 @@ std::string sm100_paged_mqa_logits_code(
       << "using namespace deep_gemm;\n\n"
       << "static void __instantiate_kernel() {\n"
       << "    auto ptr = reinterpret_cast<void*>(&sm100_paged_mqa_logits<\n"
-      << "        " << bool_literal(is_fp4) << ",\n"
       << "        " << tokens_per_request << ", " << num_heads << ",\n"
       << "        " << head_dim << ", " << page_kv << ",\n"
+      << "        " << bool_literal(is_fp4) << ",\n"
       << "        " << bool_literal(is_context_lens_2d) << ", "
       << bool_literal(is_varlen) << ",\n"
       << "        " << num_q_stages << ", " << num_kv_stages << ",\n"
       << "        " << split_kv << ", " << splits_per_chunk << ",\n"
       << "        " << num_specialized_threads << ", " << num_math_threads << ",\n"
+      << "        " << mqa_qk_dtype_name(is_fp4) << ",\n"
       << "        " << kernel_dtype_name(logits_dtype) << ",\n"
       << "        " << (weights_dtype == DEEPGEMM_DTYPE_BF16 ? "cutlass::bfloat16_t" : "float") << "\n"
       << "    >);\n"
@@ -697,7 +726,7 @@ void launch_sm90_metadata(
     const deepgemm_paged_mqa_logits_metadata_params_t& params,
     int batch_size,
     int next_n,
-    int num_sms,
+    int num_clusters,
     bool is_varlen) {
   constexpr int split_kv = 256;
   constexpr int num_threads = 32;
@@ -706,11 +735,14 @@ void launch_sm90_metadata(
 
   const auto runtime = build_kernel(
       "sm90_paged_mqa_logits_metadata",
-      sm90_metadata_code(aligned_batch_size, split_kv, num_sms, is_varlen));
+      sm90_metadata_code(aligned_batch_size, split_kv, num_clusters, is_varlen));
 
   const uint32_t batch_size_arg = static_cast<uint32_t>(batch_size);
   const uint32_t next_n_arg = static_cast<uint32_t>(next_n);
   const bool is_context_lens_2d = true;
+  // SM90 schedules all native next_n widths as one query atom. In particular,
+  // next_n=4 is one cluster task rather than two independent next_n=2 tasks.
+  const uint32_t num_next_n_atoms = 1;
   const auto* context_lens = reinterpret_cast<const uint32_t*>(params.context_lens.data);
   const auto* indices = reinterpret_cast<const uint32_t*>(params.indices.data);
   auto* schedule_meta = reinterpret_cast<uint32_t*>(params.schedule_meta.data);
@@ -727,6 +759,7 @@ void launch_sm90_metadata(
       batch_size_arg,
       next_n_arg,
       is_context_lens_2d,
+      num_next_n_atoms,
       context_lens,
       indices,
       schedule_meta);
@@ -780,6 +813,7 @@ void launch_sm90_fp8_paged_mqa_logits(
     int num_sms) {
   constexpr int num_specialized_threads = 128;
   constexpr int mma_m = 64;
+  constexpr int compute_block_kv = 64;
   constexpr int split_kv = 256;
   constexpr int num_q_stages = 3;
   constexpr int num_kv_stages = 3;
@@ -787,7 +821,8 @@ void launch_sm90_fp8_paged_mqa_logits(
   const int num_math_threads = num_math_warp_groups * 128;
   const bool is_context_lens_2d = true;
   const bool is_varlen = false;
-  const int next_n_atom = next_n >= 2 ? 2 : 1;
+  const int num_kv_multicast = as_i32(sm90_num_kv_multicast(next_n), "num_kv_multicast");
+  const int next_n_per_cta = next_n / num_kv_multicast;
 
   const int kv_cache_stride_bytes = as_i32(params.fused_kv_cache.stride[0], "fused_kv_cache stride(0)");
   const auto* kv_scale_data = byte_ptr(params.fused_kv_cache.data) + block_kv * head_dim;
@@ -798,7 +833,7 @@ void launch_sm90_fp8_paged_mqa_logits(
       head_dim,
       batch_size * next_n * num_heads,
       head_dim,
-      next_n_atom * num_heads,
+      next_n_per_cta * num_heads,
       as_i32(params.q.stride[2], "q stride(2)"),
       head_dim);
   const auto tensor_map_kv = make_tma_3d_desc(
@@ -828,25 +863,25 @@ void launch_sm90_fp8_paged_mqa_logits(
       num_heads,
       batch_size * next_n,
       num_heads,
-      next_n_atom,
+      next_n_per_cta,
       as_i32(params.weights.stride[0], "weights stride(0)"),
       0);
 
   const int swizzle_alignment = head_dim * 8;
   const int smem_q_size_per_stage =
-      next_n * num_heads * head_dim * static_cast<int>(dtype_element_size(params.q.dtype));
+      next_n_per_cta * num_heads * head_dim * static_cast<int>(dtype_element_size(params.q.dtype));
   const int aligned_smem_weight_size_per_stage = as_i32(
       align_i64(
-          next_n * num_heads * static_cast<int>(dtype_element_size(params.weights.dtype)),
+          next_n_per_cta * num_heads * static_cast<int>(dtype_element_size(params.weights.dtype)),
           swizzle_alignment),
       "aligned SM90 paged weights smem size");
   const int smem_q_pipe_size =
       num_q_stages * (smem_q_size_per_stage + aligned_smem_weight_size_per_stage) +
       as_i32(align_i64(num_q_stages * 8 * 2, swizzle_alignment), "SM90 paged q barrier smem size");
   const int smem_kv_size_per_stage =
-      block_kv * head_dim * static_cast<int>(dtype_element_size(DEEPGEMM_DTYPE_FP8_E4M3));
+      compute_block_kv * head_dim * static_cast<int>(dtype_element_size(DEEPGEMM_DTYPE_FP8_E4M3));
   const int aligned_smem_kv_scale_size_per_stage = as_i32(
-      align_i64(block_kv * static_cast<int>(sizeof(float)), swizzle_alignment),
+      align_i64(compute_block_kv * static_cast<int>(sizeof(float)), swizzle_alignment),
       "aligned SM90 paged kv scale smem size");
   const int smem_kv_pipe_size =
       num_kv_stages * (smem_kv_size_per_stage + aligned_smem_kv_scale_size_per_stage) +
@@ -870,6 +905,7 @@ void launch_sm90_fp8_paged_mqa_logits(
           split_kv,
           num_specialized_threads,
           num_math_threads,
+          num_kv_multicast,
           params.logits.dtype));
 
   const uint32_t batch_size_arg = static_cast<uint32_t>(batch_size);
@@ -885,6 +921,7 @@ void launch_sm90_fp8_paged_mqa_logits(
   launch_args.grid_x = num_sms;
   launch_args.num_threads = num_specialized_threads + num_math_threads;
   launch_args.smem_size = smem_size;
+  launch_args.cluster_dim = num_kv_multicast;
   launch_args.enable_pdl = pdl_enabled();
 
   launch_kernel(
@@ -1222,7 +1259,6 @@ void launch_paged_mqa_logits_metadata(
   if (num_sms_i64 <= 0) {
     throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "num_sms must be positive");
   }
-  require_schedule_meta(params.schedule_meta, num_sms_i64);
 
   const bool is_varlen = params.has_indices;
   if (is_varlen) {
@@ -1238,15 +1274,23 @@ void launch_paged_mqa_logits_metadata(
   if (num_sms > device.num_sms) {
     throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "num_sms exceeds current device SM count");
   }
+  const int64_t schedule_slots =
+      paged_schedule_slots(device.major, next_n_i64, num_sms_i64);
+  require_schedule_meta(params.schedule_meta, schedule_slots);
 
   if (device.major == 9) {
     if (is_varlen) {
       throw_status(DEEPGEMM_STATUS_UNSUPPORTED_ARCH, "SM90 paged metadata does not support varlen indices");
     }
-    if (block_kv != 64) {
-      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 paged metadata requires block_kv == 64");
+    if (block_kv != 32 && block_kv != 64) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 paged metadata requires block_kv == 32 or 64");
     }
-    launch_sm90_metadata(params, batch_size, next_n, num_sms, false);
+    launch_sm90_metadata(
+        params,
+        batch_size,
+        next_n,
+        as_i32(schedule_slots, "schedule_slots"),
+        false);
     return;
   }
 
@@ -1352,10 +1396,14 @@ void launch_fp8_fp4_paged_mqa_logits(
   if (num_sms_i64 <= 0 || num_sms_i64 > device.num_sms) {
     throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "num_sms must be positive and no larger than the device SM count");
   }
+  const int64_t schedule_slots =
+      paged_schedule_slots(device.major, next_n_i64, num_sms_i64);
   require_contiguous_2d_i32(params.schedule_meta, "schedule_meta");
-  if (params.schedule_meta.shape[0] != num_sms_i64 + 1 ||
+  if (params.schedule_meta.shape[0] != schedule_slots + 1 ||
       params.schedule_meta.shape[1] != 2) {
-    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "schedule_meta shape must be [num_sms + 1, 2]");
+    std::ostringstream message;
+    message << "schedule_meta shape must be [" << (schedule_slots + 1) << ", 2]";
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, message.str());
   }
 
   const bool is_varlen = params.has_indices;
@@ -1405,11 +1453,11 @@ void launch_fp8_fp4_paged_mqa_logits(
     if (params.weights.dtype != DEEPGEMM_DTYPE_F32) {
       throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 paged MQA logits require f32 weights");
     }
-    if (block_kv != 64) {
-      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 paged MQA logits require block_kv == 64");
+    if (block_kv != 32 && block_kv != 64) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 paged MQA logits require block_kv == 32 or 64");
     }
-    if (next_n != 1 && next_n != 2) {
-      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 paged MQA logits require next_n == 1 or 2");
+    if (!sm90_native_next_n(next_n)) {
+      throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 paged MQA logits require next_n == 1, 2, or 4");
     }
     if ((num_heads != 32 && num_heads != 64) ||
         (head_dim != 32 && head_dim != 64 && head_dim != 128)) {

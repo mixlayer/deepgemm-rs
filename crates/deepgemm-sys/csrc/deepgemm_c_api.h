@@ -76,6 +76,10 @@ typedef struct deepgemm_paged_mqa_logits_layout_params_t {
 } deepgemm_paged_mqa_logits_layout_params_t;
 
 typedef struct deepgemm_paged_mqa_logits_metadata_layout_params_t {
+  int32_t compute_capability_major;
+  int64_t batch_size;
+  int64_t next_n;
+  int64_t block_kv;
   int64_t num_sms;
 } deepgemm_paged_mqa_logits_metadata_layout_params_t;
 

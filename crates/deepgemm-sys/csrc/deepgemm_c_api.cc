@@ -327,17 +327,53 @@ extern "C" deepgemm_status_t deepgemm_paged_mqa_logits_metadata_layout(
   if (params == nullptr) {
     return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "metadata layout params must not be null");
   }
-  if (params->num_sms <= 0) {
-    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "num_sms must be positive");
+  if (params->batch_size <= 0 || params->next_n <= 0 || params->block_kv <= 0 ||
+      params->num_sms <= 0) {
+    return set_error(
+        DEEPGEMM_STATUS_INVALID_ARGUMENT,
+        "batch_size, next_n, block_kv, and num_sms must be positive");
   }
-  if (params->num_sms == std::numeric_limits<int64_t>::max()) {
-    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "num_sms overflowed metadata rows");
+
+  int64_t schedule_slots = params->num_sms;
+  if (params->compute_capability_major == 9) {
+    if (params->block_kv != 32 && params->block_kv != 64) {
+      return set_error(
+          DEEPGEMM_STATUS_INVALID_ARGUMENT,
+          "SM90 paged MQA requires block_kv == 32 or 64");
+    }
+    if (!deepgemm_rs::sm90_native_next_n(params->next_n)) {
+      return set_error(
+          DEEPGEMM_STATUS_INVALID_ARGUMENT,
+          "SM90 paged MQA requires next_n == 1, 2, or 4");
+    }
+    const int64_t num_kv_multicast =
+        deepgemm_rs::sm90_num_kv_multicast(params->next_n);
+    if (params->num_sms % num_kv_multicast != 0) {
+      return set_error(
+          DEEPGEMM_STATUS_INVALID_ARGUMENT,
+          "SM90 next_n == 4 requires an even physical num_sms");
+    }
+    schedule_slots /= num_kv_multicast;
+  } else if (params->compute_capability_major == 10) {
+    if (params->block_kv != 32 && params->block_kv != 64) {
+      return set_error(
+          DEEPGEMM_STATUS_INVALID_ARGUMENT,
+          "SM100 paged MQA requires block_kv == 32 or 64");
+    }
+  } else {
+    return set_error(
+        DEEPGEMM_STATUS_UNSUPPORTED_ARCH,
+        "paged MQA metadata layout supports SM90 or SM100");
+  }
+
+  if (schedule_slots == std::numeric_limits<int64_t>::max()) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "schedule slots overflowed metadata rows");
   }
   return fill_2d_layout(
       DEEPGEMM_DTYPE_I32,
-      params->num_sms + 1,
+      schedule_slots + 1,
       2,
-      params->num_sms + 1,
+      schedule_slots + 1,
       2,
       out);
 }
