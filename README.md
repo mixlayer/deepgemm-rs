@@ -125,7 +125,8 @@ This layer accepts Candle CUDA tensors, extracts stream-safe CUDA pointers, maps
 | `fp8_fp4_paged_mqa_logits` FP8 | Implemented, smoke-tested on GH200 | Implemented, needs SM100 hardware validation | Yes | Yes | Paged decode/indexer logits |
 | `fp8_fp4_paged_mqa_logits` FP4 | Rejected | Implemented, needs SM100 hardware validation | Yes | Yes | Requires SM100 |
 | Other DeepGEMM GEMMs | Planned | Planned | No | No | Not in current binding scope |
-| Mega MoE | Planned | Planned | No | No | Requires additional symmetric-memory and multi-rank work |
+| Mega MoE buffer planning | N/A | Implemented | Yes | No | Ring limits plus exact symmetric-buffer views and offsets |
+| Mega MoE launch | Rejected | Planned | No | No | Requires symmetric-memory registration and multi-rank launch work |
 | HyperConnection | Planned | Planned | No | No | Not in current binding scope |
 
 Smoke-tested means a native CUDA launch completed on the available SM90 GH200 development machine. Numerical reference tests are still planned.

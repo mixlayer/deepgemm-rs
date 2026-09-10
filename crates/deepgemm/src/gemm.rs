@@ -113,6 +113,27 @@ pub struct Fp8GemmNtLaunch {
     pub stream: deepgemm_sys::deepgemm_cuda_stream_t,
 }
 
+/// Raw launch arguments for BF16 M-grouped contiguous `nt` GEMM.
+///
+/// Computes `d[row] = a[row] @ b[grouped_layout[row]].T` for nonnegative
+/// layout entries. Padding entries must be `-1`, and expert segments must be
+/// aligned to `row_alignment` rows on SM120/SM121.
+#[derive(Debug, Copy, Clone)]
+pub struct Bf16MGroupedGemmNtLaunch {
+    /// Packed routed activations: contiguous BF16 `[m, k]`.
+    pub a: TensorArg<2>,
+    /// Expert weights: contiguous BF16 `[groups, n, k]`.
+    pub b: TensorArg<3>,
+    /// Packed outputs: contiguous BF16 `[m, n]`.
+    pub d: TensorOut<2>,
+    /// Per-row group identifiers: contiguous I32 `[m]`, with `-1` padding.
+    pub grouped_layout: TensorArg<1>,
+    /// Expert-segment and kernel block-M alignment, either 64 or 128.
+    pub row_alignment: usize,
+    /// CUDA stream for the launch.
+    pub stream: deepgemm_sys::deepgemm_cuda_stream_t,
+}
+
 impl Fp8GemmNtLaunch {
     /// Returns the shape and dtype contract for this launch.
     pub fn spec(&self) -> Fp8GemmNtSpec {
@@ -224,6 +245,53 @@ pub unsafe fn fp8_gemm_nt(params: &Fp8GemmNtLaunch) -> Result<()> {
     };
     // SAFETY: the caller upholds pointer and stream validity; `raw` is valid for this call.
     let status = unsafe { deepgemm_sys::deepgemm_fp8_gemm_nt(&raw) };
+    Error::check_raw_status(status)
+}
+
+/// Launches the SM120-family BF16 M-grouped contiguous `nt` GEMM.
+///
+/// # Safety
+///
+/// All pointers must refer to live CUDA allocations matching their tensor
+/// metadata until work enqueued on `stream` completes.
+pub unsafe fn bf16_m_grouped_gemm_nt_contiguous(params: &Bf16MGroupedGemmNtLaunch) -> Result<()> {
+    let device = crate::runtime::device_info()?;
+    if device.compute_capability_major != 12 || !matches!(device.compute_capability_minor, 0 | 1) {
+        return Err(Error::UnsupportedArch(format!(
+            "BF16 grouped GEMM requires SM120/SM121, got {}.{}",
+            device.compute_capability_major, device.compute_capability_minor
+        )));
+    }
+    require_contiguous(&params.a.spec, "a")?;
+    require_contiguous(&params.b.spec, "b")?;
+    require_contiguous(&params.d.spec, "d")?;
+    require_contiguous(&params.grouped_layout.spec, "grouped_layout")?;
+    require_dtype(&params.a.spec, DType::BF16, "a")?;
+    require_dtype(&params.b.spec, DType::BF16, "b")?;
+    require_dtype(&params.d.spec, DType::BF16, "d")?;
+    require_dtype(&params.grouped_layout.spec, DType::I32, "grouped_layout")?;
+    let [m, k] = params.a.spec.shape;
+    let [_, n, bk] = params.b.spec.shape;
+    if bk != k || params.d.spec.shape != [m, n] || params.grouped_layout.spec.shape != [m] {
+        return Err(Error::InvalidArgument(
+            "BF16 grouped GEMM tensor shapes are inconsistent".into(),
+        ));
+    }
+    if !matches!(params.row_alignment, 64 | 128) || m == 0 || m % params.row_alignment != 0 {
+        return Err(Error::InvalidArgument(
+            "BF16 grouped GEMM row_alignment must be 64 or 128 and divide m".into(),
+        ));
+    }
+    let raw = deepgemm_sys::deepgemm_bf16_m_grouped_gemm_nt_contiguous_params_t {
+        a: params.a.to_raw()?,
+        b: params.b.to_raw()?,
+        d: params.d.to_raw()?,
+        grouped_layout: params.grouped_layout.to_raw()?,
+        row_alignment: usize_to_i64(params.row_alignment, "row_alignment")?,
+        stream: params.stream,
+    };
+    // SAFETY: the caller guarantees CUDA pointer and stream validity.
+    let status = unsafe { deepgemm_sys::deepgemm_bf16_m_grouped_gemm_nt_contiguous(&raw) };
     Error::check_raw_status(status)
 }
 

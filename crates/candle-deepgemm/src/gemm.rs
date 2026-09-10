@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use candle::{DType as CandleDType, Tensor, cuda::cudarc::driver::CudaStream};
 use deepgemm::{
-    Arch, DType as DeepGemmDType, Fp8GemmNtLaunch, Fp8GemmNtSpec, Fp8GemmScaleTransformLaunch,
-    TensorArg, TensorOut, TensorSpec,
+    Arch, Bf16MGroupedGemmNtLaunch, DType as DeepGemmDType, Fp8GemmNtLaunch, Fp8GemmNtSpec,
+    Fp8GemmScaleTransformLaunch, TensorArg, TensorOut, TensorSpec,
 };
 
 use crate::{
@@ -100,6 +100,150 @@ pub fn fp8_gemm_nt(a: &Tensor, a_scale: &Tensor, b: &Tensor, b_scale: &Tensor) -
     }
 
     fp8_gemm_nt_prepared_scales(a, &a_scale_transformed, b, &b_scale_tensor)
+}
+
+/// Launches the SM120-family BF16 M-grouped contiguous `nt` GEMM.
+///
+/// Computes `d[row] = a[row] @ b[grouped_layout[row]].T` for routed rows.
+///
+/// Tensor contract:
+/// - `a`: row-major contiguous CUDA `BF16 [m, k]`.
+/// - `b`: row-major contiguous CUDA `BF16 [groups, n, k]`.
+/// - `grouped_layout`: row-major contiguous CUDA `I32 [m]`; valid rows hold
+///   their expert index and padding rows hold `-1`.
+/// - `m` is a positive multiple of 64 and every expert segment in `a` is
+///   padded to a 64-row boundary.
+/// - returns row-major contiguous CUDA `BF16 [m, n]`.
+pub fn bf16_m_grouped_gemm_nt_contiguous(
+    a: &Tensor,
+    b: &Tensor,
+    grouped_layout: &Tensor,
+) -> Result<Tensor> {
+    let m = a.dim(0)?;
+    let n = b.dim(1)?;
+    let d = Tensor::zeros((m, n), CandleDType::BF16, a.device())?;
+    bf16_m_grouped_gemm_nt_contiguous_into(a, b, grouped_layout, &d, 64)?;
+    Ok(d)
+}
+
+/// Launches grouped BF16 GEMM into caller-owned output storage.
+///
+/// `a` is contiguous CUDA BF16 `[m, k]`, `b` is contiguous CUDA BF16
+/// `[groups, n, k]`, `grouped_layout` is contiguous CUDA I32 `[m]`, and `d`
+/// is contiguous CUDA BF16 `[m, n]`. `row_alignment` must be 64 or 128,
+/// routed expert segments must use that alignment, and padding entries in
+/// `grouped_layout` must be `-1`.
+pub fn bf16_m_grouped_gemm_nt_contiguous_into(
+    a: &Tensor,
+    b: &Tensor,
+    grouped_layout: &Tensor,
+    d: &Tensor,
+    row_alignment: usize,
+) -> Result<()> {
+    ensure_same_device(a, b, "b")?;
+    ensure_same_device(a, grouped_layout, "grouped_layout")?;
+    ensure_same_device(a, d, "d")?;
+    ensure_rank(a, 2, "a")?;
+    ensure_rank(b, 3, "b")?;
+    ensure_rank(grouped_layout, 1, "grouped_layout")?;
+    ensure_rank(d, 2, "d")?;
+    ensure_dtype(a, CandleDType::BF16, "a")?;
+    ensure_dtype(b, CandleDType::BF16, "b")?;
+    ensure_dtype(grouped_layout, CandleDType::I32, "grouped_layout")?;
+    ensure_dtype(d, CandleDType::BF16, "d")?;
+
+    let a_spec = tensor_spec(a, DeepGemmDType::BF16, "a")?;
+    let b_spec = tensor_spec(b, DeepGemmDType::BF16, "b")?;
+    let grouped_layout_spec = tensor_spec(grouped_layout, DeepGemmDType::I32, "grouped_layout")?;
+    let d_spec = tensor_spec(d, DeepGemmDType::BF16, "d")?;
+    if !a_spec.is_contiguous()
+        || !b_spec.is_contiguous()
+        || !grouped_layout_spec.is_contiguous()
+        || !d_spec.is_contiguous()
+    {
+        return invalid_arg("a, b, grouped_layout, and d must be row-major contiguous");
+    }
+    let [m, k] = a_spec.shape;
+    let [_, n, b_k] = b_spec.shape;
+    if b_k != k {
+        return invalid_arg("b shape must be [groups, n, k] with the same k as a");
+    }
+    if grouped_layout_spec.shape != [m] {
+        return invalid_arg("grouped_layout shape must be [m]");
+    }
+    if d_spec.shape != [m, n] {
+        return invalid_arg("d shape must be [m, n]");
+    }
+    if !matches!(row_alignment, 64 | 128) || m == 0 || m % row_alignment != 0 {
+        return invalid_arg("row_alignment must be 64 or 128 and divide m");
+    }
+
+    let (stream, device_id) = stream_and_device_id(a)?;
+    let device_info = deepgemm::device_info()?;
+    if device_info.device != device_id {
+        return invalid_arg(format!(
+            "a is on CUDA device {device_id}, but DeepGEMM current device is {}",
+            device_info.device
+        ));
+    }
+    if device_info.compute_capability_major != 12
+        || !matches!(device_info.compute_capability_minor, 0 | 1)
+    {
+        return invalid_arg(format!(
+            "BF16 grouped GEMM requires SM120/SM121, got {}.{}",
+            device_info.compute_capability_major, device_info.compute_capability_minor
+        ));
+    }
+
+    {
+        let (a_storage, a_layout) = a.storage_and_layout();
+        let a_ptr = tensor_ptr_by_dtype(
+            &a_storage,
+            CandleDType::BF16,
+            a_layout.start_offset(),
+            &stream,
+            "a",
+        )?;
+        let (b_storage, b_layout) = b.storage_and_layout();
+        let b_ptr = tensor_ptr_by_dtype(
+            &b_storage,
+            CandleDType::BF16,
+            b_layout.start_offset(),
+            &stream,
+            "b",
+        )?;
+        let (layout_storage, layout_layout) = grouped_layout.storage_and_layout();
+        let layout_ptr = tensor_ptr_by_dtype(
+            &layout_storage,
+            CandleDType::I32,
+            layout_layout.start_offset(),
+            &stream,
+            "grouped_layout",
+        )?;
+        let (d_storage, d_layout) = d.storage_and_layout();
+        let d_ptr = tensor_ptr_by_dtype(
+            &d_storage,
+            CandleDType::BF16,
+            d_layout.start_offset(),
+            &stream,
+            "d",
+        )?;
+        let launch = Bf16MGroupedGemmNtLaunch {
+            a: tensor_arg(a_ptr.as_const_void(), a_spec),
+            b: tensor_arg(b_ptr.as_const_void(), b_spec),
+            d: TensorOut {
+                data: d_ptr.as_mut_void(),
+                spec: d_spec,
+            },
+            grouped_layout: tensor_arg(layout_ptr.as_const_void(), grouped_layout_spec),
+            row_alignment,
+            stream: stream.cu_stream() as *mut std::ffi::c_void,
+        };
+        // SAFETY: all pointers come from live, same-device Candle CUDA tensors
+        // with the validated contiguous shape and dtype contract.
+        unsafe { deepgemm::bf16_m_grouped_gemm_nt_contiguous(&launch)? };
+    }
+    Ok(())
 }
 
 /// Transforms raw F32 FP8 scales into a DeepGEMM architecture-native layout.
@@ -417,6 +561,7 @@ fn candle_dtype_for_deepgemm(dtype: DeepGemmDType) -> CandleDType {
         DeepGemmDType::F32 => CandleDType::F32,
         DeepGemmDType::BF16 => CandleDType::BF16,
         DeepGemmDType::PackedFp4E2M1 | DeepGemmDType::U8 => CandleDType::U8,
+        DeepGemmDType::I64 => CandleDType::I64,
     }
 }
 
@@ -528,6 +673,49 @@ mod tests {
                 .flatten()
                 .all(|value| (*value - k as f32).abs() < 1.0)
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUDA, SM120/SM121, and the DeepGEMM JIT toolchain"]
+    fn sm12x_bf16_grouped_gemm_smoke() -> Result<()> {
+        let Some(device) = cuda_device_or_skip() else {
+            return Ok(());
+        };
+        init_deepgemm()?;
+        let info = deepgemm::device_info()?;
+        if info.compute_capability_major != 12 || !matches!(info.compute_capability_minor, 0 | 1) {
+            println!("Skipping test: grouped BF16 smoke requires SM120/SM121");
+            return Ok(());
+        }
+
+        let n = 128usize;
+        let k = 128usize;
+        let mut weights = vec![half::bf16::from_f32(1.0); n * k];
+        weights.extend(vec![half::bf16::from_f32(2.0); n * k]);
+        let b = Tensor::from_vec(weights, (2, n, k), &device)?;
+        for alignment in [64usize, 128] {
+            let m = 2 * alignment;
+            let a = Tensor::from_vec(vec![half::bf16::from_f32(1.0); m * k], (m, k), &device)?;
+            let mut layout = vec![0i32; alignment];
+            layout.extend(vec![1i32; alignment]);
+            let grouped_layout = Tensor::from_vec(layout, m, &device)?;
+            let output = Tensor::zeros((m, n), CandleDType::BF16, &device)?;
+            bf16_m_grouped_gemm_nt_contiguous_into(&a, &b, &grouped_layout, &output, alignment)?;
+            let output = output.to_dtype(CandleDType::F32)?.to_vec2::<f32>()?;
+            assert!(
+                output[..alignment]
+                    .iter()
+                    .flatten()
+                    .all(|value| (*value - k as f32).abs() < 1.0)
+            );
+            assert!(
+                output[alignment..]
+                    .iter()
+                    .flatten()
+                    .all(|value| (*value - (2 * k) as f32).abs() < 1.0)
+            );
+        }
         Ok(())
     }
 }
