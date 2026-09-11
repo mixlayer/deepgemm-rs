@@ -102,7 +102,38 @@ fn prepare_sm120_patch(deepgemm_root: &Path, out_dir: &Path) -> (PathBuf, u64) {
         "expected producer and consumer scheduler loops in {}",
         source_path.display()
     );
-    let patched = source.replace(loop_start, valid_block_guard);
+    let scheduler_end = "        shape_m, shape_n, shape_k, grouped_layout);\n";
+    let trim_invalid_tail = concat!(
+        "        shape_m, shape_n, shape_k, grouped_layout);\n",
+        "#if DEEPGEMM_SM120_TRIM_INVALID_TAIL\n",
+        "    // M-grouped rows are block-aligned and valid block starts form a prefix.\n",
+        "    __shared__ uint32_t effective_m_blocks;\n",
+        "    if (threadIdx.x == 0) {\n",
+        "        uint32_t low = 0, high = scheduler.num_m_blocks;\n",
+        "        while (low < high) {\n",
+        "            const uint32_t mid = low + (high - low) / 2;\n",
+        "            if (grouped_layout[mid * BLOCK_M] >= 0) low = mid + 1;\n",
+        "            else high = mid;\n",
+        "        }\n",
+        "        effective_m_blocks = low;\n",
+        "    }\n",
+        "    __syncthreads();\n",
+        "    if constexpr (kGemmType == GemmType::MGroupedContiguous) {\n",
+        "        scheduler.num_m_blocks = effective_m_blocks;\n",
+        "        scheduler.num_mn_blocks = effective_m_blocks * scheduler.num_n_blocks;\n",
+        "        scheduler.num_blocks = scheduler.num_mn_blocks;\n",
+        "    }\n",
+        "#endif\n",
+    );
+    assert_eq!(
+        source.matches(scheduler_end).count(),
+        1,
+        "expected one SM120 scheduler construction in {}",
+        source_path.display()
+    );
+    let patched = source
+        .replace(loop_start, valid_block_guard)
+        .replace(scheduler_end, trim_invalid_tail);
     let patch_root = out_dir.join("deepgemm-patches");
     let output_path = patch_root.join(relative);
     std::fs::create_dir_all(output_path.parent().expect("patched header has a parent"))
