@@ -228,9 +228,11 @@ std::string compiler_flags(const std::filesystem::path& nvcc) {
   }
 
   std::lock_guard<std::mutex> lock(g_runtime_mutex);
+  flags += " -I" + shell_quote(DEEPGEMM_PATCH_INCLUDE);
   flags += " -I" + shell_quote(g_include_path);
   flags += " -I" + shell_quote(g_cutlass_include_path);
   flags += " -I" + shell_quote(g_cutlass_util_include_path);
+  flags += " -DDEEPGEMM_SM120_PATCH_ID=" + std::to_string(DEEPGEMM_SM120_PATCH_ID);
   flags += " --gpu-architecture=sm_" + nvcc_arch(info, supports_arch_family);
   flags += " --compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi";
   flags += " -O3 --expt-relaxed-constexpr --expt-extended-lambda";

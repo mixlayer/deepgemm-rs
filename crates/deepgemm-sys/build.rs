@@ -9,6 +9,8 @@ fn main() {
     let manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo"),
     );
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set by Cargo"));
+    let (patch_include, patch_id) = prepare_sm120_patch(&deepgemm_root, &out_dir);
 
     println!("cargo:rerun-if-env-changed=DEEPGEMM_ROOT");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -42,9 +44,23 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=dl");
     }
 
-    cc::Build::new()
+    let patch_include = patch_include
+        .to_str()
+        .expect("DeepGEMM patch include path must contain valid Unicode");
+    let patch_include_define = format!(
+        "\"{}\"",
+        patch_include.replace('\\', "\\\\").replace('\"', "\\\"")
+    );
+    let patch_id = format!("{patch_id}ULL");
+    let mut build = cc::Build::new();
+    build
         .cpp(true)
         .std("c++17")
+        .define(
+            "DEEPGEMM_PATCH_INCLUDE",
+            Some(patch_include_define.as_str()),
+        )
+        .define("DEEPGEMM_SM120_PATCH_ID", Some(patch_id.as_str()))
         .include(manifest_dir.join("csrc"))
         .include(cuda_include)
         .file(manifest_dir.join("csrc").join("deepgemm_c_api.cc"))
@@ -56,8 +72,47 @@ fn main() {
                 .join("csrc")
                 .join("deepgemm_raw_grouped_gemm.cc"),
         )
-        .file(manifest_dir.join("csrc").join("deepgemm_raw_mega_moe.cc"))
-        .compile("deepgemm_c_api");
+        .file(manifest_dir.join("csrc").join("deepgemm_raw_mega_moe.cc"));
+    build.compile("deepgemm_c_api");
+}
+
+fn prepare_sm120_patch(deepgemm_root: &Path, out_dir: &Path) -> (PathBuf, u64) {
+    let relative = Path::new("deep_gemm/impls/sm120_bf16_gemm.cuh");
+    let source_path = deepgemm_root.join("deep_gemm/include").join(relative);
+    let source = std::fs::read_to_string(&source_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read DeepGEMM SM120 grouped GEMM header at {}: {error}",
+            source_path.display()
+        )
+    });
+    let loop_start = "while (scheduler.get_next_block(m_block_idx, n_block_idx)) {\n";
+    let valid_block_guard = concat!(
+        "while (scheduler.get_next_block(m_block_idx, n_block_idx)) {\n",
+        "#if DEEPGEMM_SM120_SKIP_INVALID_PADDING\n",
+        "            // M-grouped capacity is a worst-case allocation; skip -1 padding blocks.\n",
+        "            if constexpr (kGemmType == GemmType::MGroupedContiguous) {\n",
+        "                if (not scheduler.is_computation_valid(m_block_idx, 0)) continue;\n",
+        "            }\n",
+        "#endif\n",
+    );
+    let occurrences = source.matches(loop_start).count();
+    assert_eq!(
+        occurrences,
+        2,
+        "expected producer and consumer scheduler loops in {}",
+        source_path.display()
+    );
+    let patched = source.replace(loop_start, valid_block_guard);
+    let patch_root = out_dir.join("deepgemm-patches");
+    let output_path = patch_root.join(relative);
+    std::fs::create_dir_all(output_path.parent().expect("patched header has a parent"))
+        .expect("failed to create DeepGEMM patch include directory");
+    std::fs::write(&output_path, &patched).expect("failed to write patched DeepGEMM SM120 header");
+
+    let patch_id = patched.bytes().fold(1469598103934665603u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(1099511628211)
+    });
+    (patch_root, patch_id)
 }
 
 fn discover_deepgemm_root() -> PathBuf {
