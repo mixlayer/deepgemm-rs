@@ -143,8 +143,11 @@ Config choose_config(int m, int n, int k, int num_sms, int block_m, bool prefer_
 }
 
 std::string kernel_code(int groups, int n, int k, int num_sms, const Config& config) {
+  const char* skip_invalid = std::getenv("DG_SM120_SKIP_INVALID_PADDING");
+  const bool skip_invalid_padding = skip_invalid == nullptr || std::string(skip_invalid) != "0";
   std::ostringstream code;
-  code << "#include <deep_gemm/impls/sm120_bf16_gemm.cuh>\n\n"
+  code << "#define DEEPGEMM_SM120_SKIP_INVALID_PADDING " << (skip_invalid_padding ? 1 : 0) << "\n"
+       << "#include <deep_gemm/impls/sm120_bf16_gemm.cuh>\n\n"
        << "using namespace deep_gemm;\n\n"
        << "static void __instantiate_kernel() {\n"
        << "  auto ptr = reinterpret_cast<void*>(&sm120_bf16_gemm_impl<\n"

@@ -695,10 +695,11 @@ mod tests {
         weights.extend(vec![half::bf16::from_f32(2.0); n * k]);
         let b = Tensor::from_vec(weights, (2, n, k), &device)?;
         for alignment in [64usize, 128] {
-            let m = 2 * alignment;
+            let m = 3 * alignment;
             let a = Tensor::from_vec(vec![half::bf16::from_f32(1.0); m * k], (m, k), &device)?;
             let mut layout = vec![0i32; alignment];
             layout.extend(vec![1i32; alignment]);
+            layout.extend(vec![-1i32; alignment]);
             let grouped_layout = Tensor::from_vec(layout, m, &device)?;
             let output = Tensor::zeros((m, n), CandleDType::BF16, &device)?;
             bf16_m_grouped_gemm_nt_contiguous_into(&a, &b, &grouped_layout, &output, alignment)?;
@@ -710,10 +711,16 @@ mod tests {
                     .all(|value| (*value - k as f32).abs() < 1.0)
             );
             assert!(
-                output[alignment..]
+                output[alignment..2 * alignment]
                     .iter()
                     .flatten()
                     .all(|value| (*value - (2 * k) as f32).abs() < 1.0)
+            );
+            assert!(
+                output[2 * alignment..]
+                    .iter()
+                    .flatten()
+                    .all(|value| *value == 0.0)
             );
         }
         Ok(())
