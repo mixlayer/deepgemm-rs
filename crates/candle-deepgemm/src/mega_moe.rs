@@ -262,6 +262,10 @@ fn tensor_spec<const RANK: usize>(
 #[cfg(test)]
 mod tests {
     use candle::Device;
+    use deepgemm::{
+        MegaMoeBufferConfig, MegaMoeMmaKind, MegaMoeRingConfig, mega_moe_buffer_layout,
+        mega_moe_ring_limits,
+    };
 
     use super::*;
 
@@ -281,6 +285,93 @@ mod tests {
                 10., 11., 12., 13., 14., 15., 24., 25., 26., 27., 28., 29., 30., 31.,
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an SM100 CUDA device and the DeepGEMM JIT toolchain"]
+    fn launches_single_rank_bf16_mega_moe() -> Result<()> {
+        let root = deepgemm::source_root()
+            .to_str()
+            .ok_or_else(|| crate::Error::Tensor("DeepGEMM root is not UTF-8".into()))?;
+        let cuda_home = std::env::var("CUDA_HOME")
+            .or_else(|_| std::env::var("CUDA_PATH"))
+            .unwrap_or_else(|_| "/usr/local/cuda".to_string());
+        deepgemm::init(root, &cuda_home)?;
+        let info = deepgemm::device_info()?;
+        if info.compute_capability_major != 10 {
+            println!(
+                "Skipping test: BF16 Mega MoE requires SM10x, got SM{}{}",
+                info.compute_capability_major, info.compute_capability_minor
+            );
+            return Ok(());
+        }
+        let device = match Device::new_cuda(0) {
+            Ok(device) => device,
+            Err(_) => {
+                println!("Skipping test: no CUDA device available");
+                return Ok(());
+            }
+        };
+        let num_experts = 256;
+        let num_topk = 8;
+        let hidden = 2048;
+        let intermediate = 512;
+        let max_tokens = 384;
+        let ring = mega_moe_ring_limits(MegaMoeRingConfig {
+            num_ranks: 1,
+            num_experts,
+            num_max_tokens_per_rank: max_tokens,
+            num_topk,
+        })?;
+        let buffer_layout = mega_moe_buffer_layout(MegaMoeBufferConfig {
+            num_ranks: 1,
+            num_experts,
+            num_max_tokens_per_rank: max_tokens,
+            num_topk,
+            hidden,
+            intermediate_hidden: intermediate,
+            num_ring_tokens: ring.max_tokens,
+            mma_kind: MegaMoeMmaKind::Bf16,
+        })?;
+        let workspace = Bf16MegaMoeWorkspace::new_single_rank(
+            Bf16MegaMoeSpec {
+                num_experts,
+                num_topk,
+                num_max_tokens_per_rank: max_tokens,
+                num_ring_tokens: ring.max_tokens,
+                buffer_layout,
+            },
+            &device,
+        )?;
+        let x = Tensor::ones((1, hidden), CandleDType::BF16, &device)?;
+        let topk_indices =
+            Tensor::from_vec((0..num_topk as i64).collect(), (1, num_topk), &device)?;
+        let topk_weights = Tensor::ones((1, num_topk), CandleDType::F32, &device)?;
+        let l1_weights = Tensor::zeros(
+            (num_experts, 2 * intermediate, hidden),
+            CandleDType::BF16,
+            &device,
+        )?;
+        let l1_weights = interleave_bf16_mega_moe_l1_weights(&l1_weights)?;
+        let l2_weights = Tensor::zeros(
+            (num_experts, hidden, intermediate),
+            CandleDType::BF16,
+            &device,
+        )?;
+
+        let output = bf16_mega_moe(
+            &workspace,
+            &x,
+            &topk_indices,
+            &topk_weights,
+            &l1_weights,
+            &l2_weights,
+        )?;
+        let output = output.to_dtype(CandleDType::F32)?.to_vec2::<f32>()?;
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].len(), hidden);
+        assert!(output[0].iter().all(|value| *value == 0.0));
         Ok(())
     }
 }
