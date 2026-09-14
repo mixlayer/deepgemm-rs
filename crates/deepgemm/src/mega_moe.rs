@@ -150,7 +150,7 @@ pub struct Bf16MegaMoeLaunch<'a> {
     pub activation_clamp: f32,
     /// Enables the upstream fast-math implementation.
     pub fast_math: bool,
-    /// CUDA stream handle used for staging copies and the kernel launch.
+    /// CUDA stream handle used for staging copies and the kernel launch; null selects the default stream.
     pub stream: *mut c_void,
 }
 
@@ -245,7 +245,6 @@ fn validate_bf16_launch(spec: &Bf16MegaMoeSpec, launch: &Bf16MegaMoeLaunch<'_>) 
     if spec.num_topk == 0
         || launch.sym_buffer_ptrs.is_empty()
         || launch.rank_idx >= launch.sym_buffer_ptrs.len()
-        || launch.stream.is_null()
         || launch.sym_buffer.spec.shape != [spec.buffer_layout.total_bytes]
     {
         return Err(Error::InvalidArgument(
@@ -385,6 +384,8 @@ fn usize_from_u64(value: u64, name: &str) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    use crate::TensorSpec;
+
     use super::*;
 
     fn single_rank_config(mma_kind: MegaMoeMmaKind) -> MegaMoeBufferConfig {
@@ -444,6 +445,73 @@ mod tests {
         assert_eq!(layout.l2_acts_scale, None);
         assert_eq!(layout.l2_acts.shape, [384, 128]);
         assert_eq!(layout.total_bytes, 543200);
+    }
+
+    #[test]
+    fn bf16_launch_accepts_the_cuda_default_stream() {
+        let config = single_rank_config(MegaMoeMmaKind::Bf16);
+        let buffer_layout = mega_moe_buffer_layout(config).unwrap();
+        let spec = Bf16MegaMoeSpec {
+            num_experts: config.num_experts,
+            num_topk: config.num_topk,
+            num_max_tokens_per_rank: config.num_max_tokens_per_rank,
+            num_ring_tokens: config.num_ring_tokens,
+            buffer_layout,
+        };
+        let const_ptr = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+        let mut_ptr = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+        let sym_buffer_ptrs = [const_ptr as usize as u64];
+        let launch = Bf16MegaMoeLaunch {
+            x: TensorArg {
+                data: const_ptr,
+                spec: TensorSpec::contiguous(DType::BF16, [1, config.hidden]),
+            },
+            topk_indices: TensorArg {
+                data: const_ptr,
+                spec: TensorSpec::contiguous(DType::I64, [1, config.num_topk]),
+            },
+            topk_weights: TensorArg {
+                data: const_ptr,
+                spec: TensorSpec::contiguous(DType::F32, [1, config.num_topk]),
+            },
+            l1_weights: TensorArg {
+                data: const_ptr,
+                spec: TensorSpec::contiguous(
+                    DType::BF16,
+                    [
+                        config.num_experts,
+                        2 * config.intermediate_hidden,
+                        config.hidden,
+                    ],
+                ),
+            },
+            l2_weights: TensorArg {
+                data: const_ptr,
+                spec: TensorSpec::contiguous(
+                    DType::BF16,
+                    [
+                        config.num_experts,
+                        config.hidden,
+                        config.intermediate_hidden,
+                    ],
+                ),
+            },
+            y: TensorOut {
+                data: mut_ptr,
+                spec: TensorSpec::contiguous(DType::BF16, [1, config.hidden]),
+            },
+            sym_buffer: TensorOut {
+                data: mut_ptr,
+                spec: TensorSpec::contiguous(DType::U8, [buffer_layout.total_bytes]),
+            },
+            sym_buffer_ptrs: &sym_buffer_ptrs,
+            rank_idx: 0,
+            activation_clamp: f32::INFINITY,
+            fast_math: true,
+            stream: std::ptr::null_mut(),
+        };
+
+        validate_bf16_launch(&spec, &launch).unwrap();
     }
 
     #[test]
