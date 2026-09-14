@@ -79,6 +79,7 @@ DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryEnumerateKernels);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuKernelGetFunction);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLaunchKernelEx);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuTensorMapEncodeTiled);
+DECL_LAZY_CUDA_DRIVER_FUNCTION(cuMemcpyDtoDAsync_v2);
 
 #undef DECL_LAZY_CUDA_DRIVER_FUNCTION
 
@@ -202,6 +203,9 @@ std::string nvcc_arch(const DeviceInfo& info, bool supports_arch_family) {
   if (info.major == 10 && info.minor != 1) {
     return supports_arch_family ? "100f" : "100a";
   }
+  if (info.major == 12 && supports_arch_family) {
+    return "120f";
+  }
   return std::to_string(info.major * 10 + info.minor) + "a";
 }
 
@@ -224,9 +228,11 @@ std::string compiler_flags(const std::filesystem::path& nvcc) {
   }
 
   std::lock_guard<std::mutex> lock(g_runtime_mutex);
+  flags += " -I" + shell_quote(DEEPGEMM_PATCH_INCLUDE);
   flags += " -I" + shell_quote(g_include_path);
   flags += " -I" + shell_quote(g_cutlass_include_path);
   flags += " -I" + shell_quote(g_cutlass_util_include_path);
+  flags += " -DDEEPGEMM_SM120_PATCH_ID=" + std::to_string(DEEPGEMM_SM120_PATCH_ID);
   flags += " --gpu-architecture=sm_" + nvcc_arch(info, supports_arch_family);
   flags += " --compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi";
   flags += " -O3 --expt-relaxed-constexpr --expt-extended-lambda";
@@ -375,6 +381,8 @@ void runtime_init(const std::string& deepgemm_root, const std::string& cuda_home
   const auto cuda = std::filesystem::weakly_canonical(cuda_home);
   require_file(root / "deep_gemm/include/deep_gemm/scheduler/sm90_paged_mqa_logits.cuh", "DeepGEMM SM90 scheduler header");
   require_file(root / "deep_gemm/include/deep_gemm/scheduler/sm100_paged_mqa_logits.cuh", "DeepGEMM SM100 scheduler header");
+  require_file(root / "deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh", "DeepGEMM SM100 BF16 Mega MoE header");
+  require_file(root / "deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh", "DeepGEMM SM120 BF16 GEMM header");
   require_file(root / "third-party/cutlass/include/cutlass/cutlass.h", "CUTLASS header");
   require_file(cuda / "bin/nvcc", "CUDA nvcc");
 
@@ -563,6 +571,23 @@ void launch_kernel_ex(
   check_cuda(lazy_cuLaunchKernelEx(&config, kernel, kernel_args, nullptr), "cuLaunchKernelEx");
 }
 
+void copy_device_to_device_async(
+    void* destination,
+    const void* source,
+    uint64_t bytes,
+    CUstream stream) {
+  if (destination == nullptr || source == nullptr) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "device copy pointers must not be null");
+  }
+  check_cuda(
+      lazy_cuMemcpyDtoDAsync_v2(
+          reinterpret_cast<CUdeviceptr>(destination),
+          reinterpret_cast<CUdeviceptr>(source),
+          static_cast<size_t>(bytes),
+          stream),
+      "cuMemcpyDtoDAsync_v2");
+}
+
 int64_t dtype_element_size(deepgemm_dtype_t dtype) {
   switch (dtype) {
     case DEEPGEMM_DTYPE_FP8_E4M3:
@@ -575,6 +600,8 @@ int64_t dtype_element_size(deepgemm_dtype_t dtype) {
     case DEEPGEMM_DTYPE_F32:
     case DEEPGEMM_DTYPE_I32:
       return 4;
+    case DEEPGEMM_DTYPE_I64:
+      return 8;
     default:
       return 0;
   }

@@ -78,6 +78,12 @@ void launch_kernel_ex(
     CUfunction kernel,
     void** kernel_args);
 
+void copy_device_to_device_async(
+    void* destination,
+    const void* source,
+    uint64_t bytes,
+    CUstream stream);
+
 template <typename... ArgTypes>
 void launch_kernel(
     const std::shared_ptr<KernelRuntime>& runtime,
