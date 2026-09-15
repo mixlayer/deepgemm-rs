@@ -32,6 +32,34 @@ pub const DEEPGEMM_DTYPE_BF16: deepgemm_dtype_t = 5;
 pub const DEEPGEMM_DTYPE_I32: deepgemm_dtype_t = 6;
 pub const DEEPGEMM_DTYPE_U8: deepgemm_dtype_t = 7;
 
+/// Kernel materialization source reported by the DeepGEMM runtime.
+pub type deepgemm_kernel_materialization_source_t = c_int;
+
+pub const DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_PROCESS_CACHE:
+    deepgemm_kernel_materialization_source_t = 0;
+pub const DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_DISK_CUBIN:
+    deepgemm_kernel_materialization_source_t = 1;
+pub const DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_JIT_COMPILE:
+    deepgemm_kernel_materialization_source_t = 2;
+
+/// Kernel materialization phase reported by the DeepGEMM runtime.
+pub type deepgemm_kernel_materialization_phase_t = c_int;
+
+pub const DEEPGEMM_KERNEL_MATERIALIZATION_PHASE_START: deepgemm_kernel_materialization_phase_t = 0;
+pub const DEEPGEMM_KERNEL_MATERIALIZATION_PHASE_FINISH: deepgemm_kernel_materialization_phase_t = 1;
+
+/// Callback invoked when the DeepGEMM runtime materializes a kernel.
+pub type deepgemm_kernel_materialization_hook_t = Option<
+    unsafe extern "C" fn(
+        kernel_name: *const c_char,
+        source: deepgemm_kernel_materialization_source_t,
+        phase: deepgemm_kernel_materialization_phase_t,
+        success: bool,
+        has_duration: bool,
+        duration_ns: u64,
+    ),
+>;
+
 /// DeepGEMM source root selected by the build script.
 pub const DEEPGEMM_SOURCE_ROOT: &str = env!("DEEPGEMM_SOURCE_ROOT");
 
@@ -207,6 +235,10 @@ unsafe extern "C" {
     pub fn deepgemm_set_num_sms(num_sms: i32) -> deepgemm_status_t;
 
     pub fn deepgemm_set_pdl(enabled: bool) -> deepgemm_status_t;
+
+    pub fn deepgemm_set_kernel_materialization_hook(
+        hook: deepgemm_kernel_materialization_hook_t,
+    ) -> deepgemm_status_t;
 
     pub fn deepgemm_mqa_logits_layout(
         params: *const deepgemm_mqa_logits_layout_params_t,

@@ -1,6 +1,14 @@
-use std::ffi::CString;
+use std::{
+    ffi::{CStr, CString},
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 
 use crate::{Arch, Error, Result};
+
+/// Process-global callback used to observe DeepGEMM kernel materialization events.
+pub type KernelMaterializationHook = dyn Fn(KernelMaterializationEvent) + Send + Sync + 'static;
 
 /// Current CUDA device information reported by the native DeepGEMM runtime.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -26,6 +34,125 @@ impl DeviceInfo {
                 ))
             })
     }
+}
+
+/// Source that produced a launchable DeepGEMM kernel for the current process.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum KernelMaterializationSource {
+    /// The current process already had a live kernel runtime cached in memory.
+    ProcessCache,
+    /// The current process loaded a precompiled cubin from the on-disk JIT cache.
+    DiskCubin,
+    /// The current process compiled a new cubin through `nvcc`.
+    JitCompile,
+}
+
+impl KernelMaterializationSource {
+    fn from_raw(raw: deepgemm_sys::deepgemm_kernel_materialization_source_t) -> Option<Self> {
+        match raw {
+            deepgemm_sys::DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_PROCESS_CACHE => {
+                Some(Self::ProcessCache)
+            }
+            deepgemm_sys::DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_DISK_CUBIN => {
+                Some(Self::DiskCubin)
+            }
+            deepgemm_sys::DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_JIT_COMPILE => {
+                Some(Self::JitCompile)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Phase of a DeepGEMM kernel materialization event.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum KernelMaterializationPhase {
+    /// The runtime has started loading or compiling a kernel.
+    Start,
+    /// The runtime finished loading or compiling a kernel.
+    Finish,
+}
+
+impl KernelMaterializationPhase {
+    fn from_raw(raw: deepgemm_sys::deepgemm_kernel_materialization_phase_t) -> Option<Self> {
+        match raw {
+            deepgemm_sys::DEEPGEMM_KERNEL_MATERIALIZATION_PHASE_START => Some(Self::Start),
+            deepgemm_sys::DEEPGEMM_KERNEL_MATERIALIZATION_PHASE_FINISH => Some(Self::Finish),
+            _ => None,
+        }
+    }
+}
+
+/// Kernel materialization event emitted by the DeepGEMM runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelMaterializationEvent {
+    /// Low-cardinality kernel family name from the native runtime.
+    pub kernel: String,
+    /// Source that satisfied the kernel materialization request.
+    pub source: KernelMaterializationSource,
+    /// Whether the event marks the start or finish of the materialization.
+    pub phase: KernelMaterializationPhase,
+    /// Whether the materialization path succeeded.
+    pub success: bool,
+    /// Wall-clock duration for finished materializations.
+    pub duration: Option<Duration>,
+}
+
+fn kernel_materialization_hook() -> &'static Mutex<Option<Arc<KernelMaterializationHook>>> {
+    static HOOK: OnceLock<Mutex<Option<Arc<KernelMaterializationHook>>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+fn kernel_materialization_event_from_raw(
+    kernel_name: &CStr,
+    source: deepgemm_sys::deepgemm_kernel_materialization_source_t,
+    phase: deepgemm_sys::deepgemm_kernel_materialization_phase_t,
+    success: bool,
+    has_duration: bool,
+    duration_ns: u64,
+) -> Option<KernelMaterializationEvent> {
+    Some(KernelMaterializationEvent {
+        kernel: kernel_name.to_str().ok()?.to_owned(),
+        source: KernelMaterializationSource::from_raw(source)?,
+        phase: KernelMaterializationPhase::from_raw(phase)?,
+        success,
+        duration: has_duration.then(|| Duration::from_nanos(duration_ns)),
+    })
+}
+
+unsafe extern "C" fn kernel_materialization_callback(
+    kernel_name: *const std::ffi::c_char,
+    source: deepgemm_sys::deepgemm_kernel_materialization_source_t,
+    phase: deepgemm_sys::deepgemm_kernel_materialization_phase_t,
+    success: bool,
+    has_duration: bool,
+    duration_ns: u64,
+) {
+    if kernel_name.is_null() {
+        return;
+    }
+    let hook = match kernel_materialization_hook().lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    let Some(hook) = hook else {
+        return;
+    };
+    let Some(event) = ({
+        // SAFETY: the native runtime only invokes the hook with a valid NUL-terminated kernel name.
+        let kernel_name = unsafe { CStr::from_ptr(kernel_name) };
+        kernel_materialization_event_from_raw(
+            kernel_name,
+            source,
+            phase,
+            success,
+            has_duration,
+            duration_ns,
+        )
+    }) else {
+        return;
+    };
+    let _ = catch_unwind(AssertUnwindSafe(|| hook(event)));
 }
 
 /// Initializes the DeepGEMM native runtime.
@@ -83,4 +210,46 @@ pub fn set_pdl(enabled: bool) -> Result<()> {
     // SAFETY: forwards a plain boolean to the native runtime.
     let status = unsafe { deepgemm_sys::deepgemm_set_pdl(enabled) };
     Error::check_raw_status(status)
+}
+
+/// Registers or clears a process-global hook for kernel materialization events.
+pub fn set_kernel_materialization_hook(hook: Option<Arc<KernelMaterializationHook>>) -> Result<()> {
+    let callback = match kernel_materialization_hook().lock() {
+        Ok(mut guard) => {
+            *guard = hook;
+            guard.as_ref().map(|_| kernel_materialization_callback as _)
+        }
+        Err(_) => None,
+    };
+    // SAFETY: registers either a static callback or null with the native runtime.
+    let status = unsafe { deepgemm_sys::deepgemm_set_kernel_materialization_hook(callback) };
+    Error::check_raw_status(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        KernelMaterializationPhase, KernelMaterializationSource,
+        kernel_materialization_event_from_raw,
+    };
+    use std::{ffi::CString, time::Duration};
+
+    #[test]
+    fn raw_kernel_materialization_event_maps_to_rust_event() {
+        let event = kernel_materialization_event_from_raw(
+            &CString::new("sm100_paged_mqa_logits").unwrap(),
+            deepgemm_sys::DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_JIT_COMPILE,
+            deepgemm_sys::DEEPGEMM_KERNEL_MATERIALIZATION_PHASE_FINISH,
+            true,
+            true,
+            123,
+        )
+        .unwrap();
+
+        assert_eq!(event.kernel, "sm100_paged_mqa_logits");
+        assert_eq!(event.source, KernelMaterializationSource::JitCompile);
+        assert_eq!(event.phase, KernelMaterializationPhase::Finish);
+        assert!(event.success);
+        assert_eq!(event.duration, Some(Duration::from_nanos(123)));
+    }
 }
