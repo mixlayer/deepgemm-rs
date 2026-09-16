@@ -7,7 +7,7 @@ use std::{
 
 use crate::{Arch, Error, Result};
 
-/// Process-global callback used to observe DeepGEMM kernel materialization events.
+/// Process-global callback used to observe DeepGEMM disk loads and JIT compiles.
 pub type KernelMaterializationHook = dyn Fn(KernelMaterializationEvent) + Send + Sync + 'static;
 
 /// Current CUDA device information reported by the native DeepGEMM runtime.
@@ -39,7 +39,7 @@ impl DeviceInfo {
 /// Source that produced a launchable DeepGEMM kernel for the current process.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum KernelMaterializationSource {
-    /// The current process already had a live kernel runtime cached in memory.
+    /// Reserved for API compatibility; process-cache hits do not emit hook events.
     ProcessCache,
     /// The current process loaded a precompiled cubin from the on-disk JIT cache.
     DiskCubin,
@@ -212,7 +212,7 @@ pub fn set_pdl(enabled: bool) -> Result<()> {
     Error::check_raw_status(status)
 }
 
-/// Registers or clears a process-global hook for kernel materialization events.
+/// Registers or clears a process-global hook for DeepGEMM disk loads and JIT compiles.
 pub fn set_kernel_materialization_hook(hook: Option<Arc<KernelMaterializationHook>>) -> Result<()> {
     let callback = match kernel_materialization_hook().lock() {
         Ok(mut guard) => {

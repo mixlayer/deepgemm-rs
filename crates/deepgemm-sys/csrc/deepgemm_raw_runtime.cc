@@ -336,12 +336,9 @@ std::shared_ptr<KernelRuntime> load_cached_kernel(
     std::lock_guard<std::mutex> lock(g_runtime_mutex);
     auto entry = g_kernel_cache.find(cache_key);
     if (entry != g_kernel_cache.end()) {
-      auto runtime = entry->second;
-      KernelMaterializationScope scope(
-          name,
-          DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_PROCESS_CACHE);
-      scope.finish_success();
-      return runtime;
+      // This is the kernel launch hot path. Do not invoke the materialization
+      // hook or acquire its mutex for process-local cache hits.
+      return entry->second;
     }
   }
   if (!std::filesystem::exists(dir_path / "kernel.cubin")) {

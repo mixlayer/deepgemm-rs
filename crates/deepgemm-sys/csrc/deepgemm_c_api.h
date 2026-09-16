@@ -28,6 +28,7 @@ typedef enum deepgemm_dtype_t {
 } deepgemm_dtype_t;
 
 typedef enum deepgemm_kernel_materialization_source_t {
+  // Reserved for API compatibility; process-cache hits do not invoke the hook.
   DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_PROCESS_CACHE = 0,
   DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_DISK_CUBIN = 1,
   DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_JIT_COMPILE = 2,

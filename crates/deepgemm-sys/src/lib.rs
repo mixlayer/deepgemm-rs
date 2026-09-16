@@ -35,6 +35,7 @@ pub const DEEPGEMM_DTYPE_U8: deepgemm_dtype_t = 7;
 /// Kernel materialization source reported by the DeepGEMM runtime.
 pub type deepgemm_kernel_materialization_source_t = c_int;
 
+/// Reserved for API compatibility; process-cache hits do not invoke the materialization hook.
 pub const DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_PROCESS_CACHE:
     deepgemm_kernel_materialization_source_t = 0;
 pub const DEEPGEMM_KERNEL_MATERIALIZATION_SOURCE_DISK_CUBIN:
