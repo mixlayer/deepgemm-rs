@@ -27,7 +27,6 @@ struct MegaMoeConfig {
   int load_block_n;
   int store_block_m;
   int num_ring_tokens;
-  int num_experts_per_wave;
   int num_stages;
   int smem_size;
   int num_dispatch_threads;
@@ -109,82 +108,12 @@ void require_range(uint64_t offset, uint64_t bytes, uint64_t total, const char* 
   }
 }
 
-int num_wave_pool_tokens(
-    int num_ranks,
-    int num_topk,
-    int num_max_tokens_per_rank,
-    int num_experts_per_wave,
-    int block_m) {
-  const int64_t all_tokens = static_cast<int64_t>(num_max_tokens_per_rank) * num_ranks;
-  if (num_experts_per_wave == 1) {
-    return as_i32(all_tokens, "wave tokens");
-  }
-  const int64_t all_expert_tokens = all_tokens * num_experts_per_wave;
-  const int64_t all_routed_tokens = align_int(
-      as_i32(all_tokens * num_topk + static_cast<int64_t>(num_experts_per_wave) * (block_m - 1), "routed wave tokens"),
-      block_m);
-  return as_i32(std::min(all_expert_tokens, all_routed_tokens), "wave tokens");
-}
-
-int experts_per_wave(
-    int num_experts_per_rank,
-    int num_tokens,
-    int num_topk,
-    int intermediate_hidden,
-    int block_m,
-    int block_n,
-    int num_sms,
-    int num_ring_tokens,
-    int num_max_tokens_per_rank,
-    int num_ranks) {
-  int max_experts = num_experts_per_rank;
-  while (max_experts > 0 &&
-         num_wave_pool_tokens(num_ranks, num_topk, num_max_tokens_per_rank, max_experts, block_m) > num_ring_tokens) {
-    --max_experts;
-  }
-  if (max_experts == 0) {
-    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "Mega MoE ring is too small for one expert wave");
-  }
-
-  const float expected_tokens = static_cast<float>(num_tokens * num_topk) / num_experts_per_rank;
-  const int expected_m_blocks = std::max(
-      static_cast<int>(ceil_div(static_cast<int>(std::ceil(expected_tokens)), block_m)), 1);
-  const int l1_n_blocks = (2 * intermediate_hidden) / block_n;
-  const int expected_l1_blocks = expected_m_blocks * l1_n_blocks;
-  int min_experts = static_cast<int>(ceil_div(2 * num_sms, expected_l1_blocks));
-  if (expected_tokens < 1.0f) {
-    min_experts = num_experts_per_rank;
-  }
-  if (min_experts >= max_experts) {
-    return max_experts;
-  }
-  if (expected_l1_blocks >= num_sms) {
-    return min_experts;
-  }
-
-  const int sweep_max = std::min(max_experts, min_experts * 2);
-  int best = min_experts;
-  float best_tail = -1.0f;
-  for (int candidate = min_experts; candidate <= sweep_max; ++candidate) {
-    const int remainder = num_experts_per_rank % candidate;
-    const float tail = remainder == 0 ? 1.0f : static_cast<float>(remainder) / candidate;
-    if (tail > best_tail) {
-      best_tail = tail;
-      best = candidate;
-    }
-  }
-  return best;
-}
-
 MegaMoeConfig choose_config(
     int num_ranks,
     int num_experts,
-    int num_experts_per_rank,
-    int num_max_tokens_per_rank,
     int num_tokens,
     int num_topk,
     int hidden,
-    int intermediate_hidden,
     int num_ring_tokens) {
   const float expected = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
   int block_m;
@@ -225,8 +154,13 @@ MegaMoeConfig choose_config(
   const int cd_l1 = epilogue_warpgroups * store_block_m * (block_n / 2) * 2 * 2;
   const int cd_l2 = epilogue_warpgroups * store_block_m * block_n * 2;
   const int cd_size = align_int(std::max(cd_l1, cd_l2), 1024);
-  const int barriers = (num_dispatch_warps + 4 + num_epilogue_warps * 2) * 8;
-  const int fixed = dispatch_size + cd_size + barriers + 4;
+  constexpr int num_schedule_stages = 2;
+  // Upstream sched::TaskInfo has eight uint32_t fields and 16-byte alignment.
+  constexpr int task_info_bytes = 32;
+  const int schedule_tasks = num_schedule_stages * task_info_bytes;
+  const int barriers =
+      (num_dispatch_warps + 4 + num_epilogue_warps * 2 + num_schedule_stages * 2) * 8;
+  const int fixed = dispatch_size + cd_size + schedule_tasks + barriers + 4;
   const int stage_size = load_block_m * block_k * 2 + block_n * block_k * 2 + 16;
   const int num_stages = (kSmemCapacity - fixed) / stage_size;
   if (num_stages < 2) {
@@ -241,10 +175,6 @@ MegaMoeConfig choose_config(
       block_n,
       store_block_m,
       num_ring_tokens,
-      experts_per_wave(
-          num_experts_per_rank, num_tokens, num_topk, intermediate_hidden,
-          block_m, block_n, effective_num_sms(), num_ring_tokens,
-          num_max_tokens_per_rank, num_ranks),
       num_stages,
       fixed + num_stages * stage_size,
       num_dispatch_threads,
@@ -276,8 +206,8 @@ std::string generate_code(
        << "  auto ptr = reinterpret_cast<void*>(&sm100_bf16_mega_moe_impl<\n"
        << "    " << params.num_max_tokens_per_rank << ",\n"
        << "    " << hidden << ", " << intermediate_hidden << ",\n"
-       << "    " << num_experts << ", " << params.num_topk << ",\n"
-       << "    " << config.num_experts_per_wave << ",\n"
+       << "    " << num_experts << ", 0,\n"
+       << "    " << params.num_topk << ",\n"
        << "    " << config.block_m << ", " << config.block_n << ", " << config.block_k << ",\n"
        << "    " << config.store_block_m << ",\n"
        << "    " << config.num_ring_tokens << ",\n"
@@ -302,7 +232,7 @@ void print_config_once(
   }
   std::ostringstream key;
   key << num_tokens << ':' << hidden << ':' << intermediate_hidden << ':' << num_experts
-      << ':' << config.block_m << ':' << config.num_experts_per_wave;
+      << ':' << config.block_m;
   static std::unordered_set<std::string> printed;
   if (!printed.insert(key.str()).second) {
     return;
@@ -310,7 +240,7 @@ void print_config_once(
   std::cout << "DeepGEMM raw sm100 bf16_mega_moe(tokens=" << num_tokens
             << ", hidden=" << hidden << ", intermediate=" << intermediate_hidden
             << ", experts=" << num_experts << "): block_m=" << config.block_m
-            << ", block_k=" << config.block_k << ", experts_per_wave=" << config.num_experts_per_wave
+            << ", block_k=" << config.block_k
             << ", stages=" << config.num_stages << ", smem=" << config.smem_size << std::endl;
 }
 
@@ -325,8 +255,8 @@ void launch_bf16_mega_moe(const deepgemm_bf16_mega_moe_params_t& params) {
   }
   if (params.num_ranks <= 0 || params.num_ranks > kNumMaxRanks ||
       params.rank_idx < 0 || params.rank_idx >= params.num_ranks ||
-      params.sym_buffer_ptrs == nullptr || params.stream == nullptr) {
-    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "invalid Mega MoE rank, pointer table, or stream");
+      params.sym_buffer_ptrs == nullptr) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "invalid Mega MoE rank or pointer table");
   }
   if (params.num_max_tokens_per_rank <= 0 || params.num_ring_tokens <= 0 ||
       params.num_experts <= 0 || params.num_topk <= 0 ||
@@ -376,9 +306,8 @@ void launch_bf16_mega_moe(const deepgemm_bf16_mega_moe_params_t& params) {
   copy_device_to_device_async(buffer + params.topk_weights_offset_bytes, params.topk_weights.data, weights_bytes, stream);
 
   const auto config = choose_config(
-      params.num_ranks, params.num_experts, num_experts_per_rank,
-      params.num_max_tokens_per_rank, num_tokens, params.num_topk,
-      hidden, intermediate_hidden, params.num_ring_tokens);
+      params.num_ranks, params.num_experts, num_tokens, params.num_topk,
+      hidden, params.num_ring_tokens);
   const int num_sms = effective_num_sms();
   print_config_once(num_tokens, hidden, intermediate_hidden, params.num_experts, config);
 
@@ -424,6 +353,8 @@ void launch_bf16_mega_moe(const deepgemm_bf16_mega_moe_params_t& params) {
   launch_kernel(
       runtime, stream, launch_args,
       params.y.data, stats, num_tokens, sym_buffer,
+      tensor_map_l1_acts, tensor_map_l1_weights, tensor_map_l1_output,
+      tensor_map_l2_acts, tensor_map_l2_weights,
       tensor_map_l1_acts, tensor_map_l1_weights, tensor_map_l1_output,
       tensor_map_l2_acts, tensor_map_l2_weights);
 }
