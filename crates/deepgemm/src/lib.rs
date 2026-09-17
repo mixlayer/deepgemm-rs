@@ -30,8 +30,10 @@ pub use gemm::{
 };
 pub use mega_moe::{
     Bf16MegaMoeLaunch, Bf16MegaMoeSpec, MegaMoeBufferConfig, MegaMoeBufferLayout,
-    MegaMoeBufferView, MegaMoeMmaKind, MegaMoeRingConfig, MegaMoeRingLimits, bf16_mega_moe,
-    mega_moe_buffer_layout, mega_moe_ring_limits, mega_moe_token_alignment,
+    MegaMoeBufferView, MegaMoeMmaKind, MegaMoeRingConfig, MegaMoeRingLimits, Sm90Fp8MegaMoeLaunch,
+    Sm90Fp8MegaMoeSpec, bf16_mega_moe, fp8_mega_moe_interleave_l1_weights, mega_moe_buffer_layout,
+    mega_moe_ring_limits, mega_moe_token_alignment, sm90_fp8_mega_moe,
+    sm90_fp8_mega_moe_buffer_layout,
 };
 pub use mqa::{
     MqaLogitsLaunch, MqaLogitsSpec, PagedMqaLogitsLaunch, PagedMqaLogitsMetadataLaunch,

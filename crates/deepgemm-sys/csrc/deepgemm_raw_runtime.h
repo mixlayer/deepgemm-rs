@@ -129,4 +129,13 @@ CUtensorMap make_tma_3d_desc(
     bool allow_tf32 = false,
     bool fp4_unpacked_smem = true);
 
+CUtensorMap make_tma_sf_desc(
+    const void* data,
+    deepgemm_dtype_t dtype,
+    int shape_mn,
+    int shape_k,
+    int block_mn,
+    int gran_k,
+    int num_groups = 1);
+
 }  // namespace deepgemm_rs

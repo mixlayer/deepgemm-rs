@@ -464,6 +464,7 @@ void runtime_init(const std::string& deepgemm_root, const std::string& cuda_home
   require_file(root / "deep_gemm/include/deep_gemm/scheduler/sm90_paged_mqa_logits.cuh", "DeepGEMM SM90 scheduler header");
   require_file(root / "deep_gemm/include/deep_gemm/scheduler/sm100_paged_mqa_logits.cuh", "DeepGEMM SM100 scheduler header");
   require_file(root / "deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh", "DeepGEMM SM100 BF16 Mega MoE header");
+  require_file(root / "deep_gemm/include/deep_gemm/impls/sm90_fp8_mega_moe.cuh", "DeepGEMM SM90 FP8 Mega MoE header");
   require_file(root / "deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh", "DeepGEMM SM120 BF16 GEMM header");
   require_file(root / "third-party/cutlass/include/cutlass/cutlass.h", "CUTLASS header");
   require_file(cuda / "bin/nvcc", "CUDA nvcc");
@@ -902,6 +903,29 @@ KernelRuntime::~KernelRuntime() {
 
 CUfunction KernelRuntime::kernel() const {
   return kernel_;
+}
+
+CUtensorMap make_tma_sf_desc(
+    const void* data,
+    deepgemm_dtype_t dtype,
+    int shape_mn,
+    int shape_k,
+    int block_mn,
+    int gran_k,
+    int num_groups) {
+  if (dtype != DEEPGEMM_DTYPE_F32) {
+    throw_status(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 Mega MoE scale maps require F32");
+  }
+  shape_mn = static_cast<int>(get_tma_aligned_size(shape_mn, dtype_element_size(dtype)));
+  return make_tma_2d_desc(
+      data,
+      dtype,
+      shape_mn,
+      ((shape_k + gran_k - 1) / gran_k) * num_groups,
+      block_mn,
+      1,
+      shape_mn,
+      0);
 }
 
 }  // namespace deepgemm_rs

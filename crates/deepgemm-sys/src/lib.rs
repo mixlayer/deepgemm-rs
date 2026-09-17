@@ -39,6 +39,7 @@ pub type deepgemm_mega_moe_mma_kind_t = c_int;
 pub const DEEPGEMM_MEGA_MOE_MMA_INVALID: deepgemm_mega_moe_mma_kind_t = 0;
 pub const DEEPGEMM_MEGA_MOE_MMA_FP8_FP4: deepgemm_mega_moe_mma_kind_t = 1;
 pub const DEEPGEMM_MEGA_MOE_MMA_BF16: deepgemm_mega_moe_mma_kind_t = 2;
+pub const DEEPGEMM_MEGA_MOE_MMA_FP8_FP8_SM90: deepgemm_mega_moe_mma_kind_t = 3;
 
 /// Kernel materialization source reported by the DeepGEMM runtime.
 pub type deepgemm_kernel_materialization_source_t = c_int;
@@ -323,6 +324,47 @@ pub struct deepgemm_bf16_mega_moe_params_t {
     pub stream: deepgemm_cuda_stream_t,
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct deepgemm_sm90_fp8_mega_moe_params_t {
+    pub x: deepgemm_tensor_t,
+    pub x_scale: deepgemm_tensor_t,
+    pub topk_indices: deepgemm_tensor_t,
+    pub topk_weights: deepgemm_tensor_t,
+    pub l1_weights: deepgemm_tensor_t,
+    pub l1_weights_scale: deepgemm_tensor_t,
+    pub l2_weights: deepgemm_tensor_t,
+    pub l2_weights_scale: deepgemm_tensor_t,
+    pub y: deepgemm_tensor_mut_t,
+    pub sym_buffer: deepgemm_tensor_mut_t,
+    pub sym_buffer_ptrs: *const u64,
+    pub num_ranks: i32,
+    pub rank_idx: i32,
+    pub num_max_tokens_per_rank: i32,
+    pub num_experts: i32,
+    pub num_topk: i32,
+    pub x_offset_bytes: u64,
+    pub x_scale_offset_bytes: u64,
+    pub topk_indices_offset_bytes: u64,
+    pub topk_weights_offset_bytes: u64,
+    pub l1_acts_offset_bytes: u64,
+    pub l1_acts_scale_offset_bytes: u64,
+    pub l2_acts_offset_bytes: u64,
+    pub l2_acts_scale_offset_bytes: u64,
+    pub activation_clamp: f32,
+    pub fast_math: bool,
+    pub stream: deepgemm_cuda_stream_t,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct deepgemm_fp8_mega_moe_interleave_params_t {
+    pub weights: deepgemm_tensor_t,
+    pub output: deepgemm_tensor_mut_t,
+    pub input_up_gate: bool,
+    pub stream: deepgemm_cuda_stream_t,
+}
+
 unsafe extern "C" {
     /// Returns the most recent error message recorded by the C ABI layer.
     pub fn deepgemm_last_error() -> *const c_char;
@@ -381,6 +423,11 @@ unsafe extern "C" {
         out: *mut deepgemm_mega_moe_buffer_layout_t,
     ) -> deepgemm_status_t;
 
+    pub fn deepgemm_sm90_fp8_mega_moe_buffer_layout(
+        params: *const deepgemm_mega_moe_buffer_params_t,
+        out: *mut deepgemm_mega_moe_buffer_layout_t,
+    ) -> deepgemm_status_t;
+
     pub fn deepgemm_fp8_fp4_mqa_logits(
         params: *const deepgemm_mqa_logits_params_t,
     ) -> deepgemm_status_t;
@@ -405,5 +452,13 @@ unsafe extern "C" {
 
     pub fn deepgemm_bf16_mega_moe(
         params: *const deepgemm_bf16_mega_moe_params_t,
+    ) -> deepgemm_status_t;
+
+    pub fn deepgemm_sm90_fp8_mega_moe(
+        params: *const deepgemm_sm90_fp8_mega_moe_params_t,
+    ) -> deepgemm_status_t;
+
+    pub fn deepgemm_fp8_mega_moe_interleave_l1_weights(
+        params: *const deepgemm_fp8_mega_moe_interleave_params_t,
     ) -> deepgemm_status_t;
 }

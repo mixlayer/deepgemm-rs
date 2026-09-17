@@ -780,6 +780,85 @@ extern "C" deepgemm_status_t deepgemm_mega_moe_buffer_layout(
   return clear_error();
 }
 
+extern "C" deepgemm_status_t deepgemm_sm90_fp8_mega_moe_buffer_layout(
+    const deepgemm_mega_moe_buffer_params_t* params,
+    deepgemm_mega_moe_buffer_layout_t* out) {
+  if (params == nullptr || out == nullptr) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 FP8 Mega MoE buffer params and output must not be null");
+  }
+  if (params->num_ranks <= 0 || params->num_ranks > 72 || params->num_experts <= 0 ||
+      params->num_experts % params->num_ranks != 0 || params->num_max_tokens_per_rank <= 0 ||
+      params->num_max_tokens_per_rank % 128 != 0 || params->num_topk <= 0 ||
+      params->num_topk > params->num_experts || params->hidden <= 0 || params->hidden % 256 != 0 ||
+      params->intermediate_hidden <= 0 || params->intermediate_hidden % 128 != 0 ||
+      params->mma_kind != DEEPGEMM_MEGA_MOE_MMA_FP8_FP8_SM90) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "invalid SM90 FP8 Mega MoE buffer configuration");
+  }
+
+  const uint64_t ranks = static_cast<uint64_t>(params->num_ranks);
+  const uint64_t experts = static_cast<uint64_t>(params->num_experts);
+  const uint64_t experts_per_rank = experts / ranks;
+  const uint64_t max_tokens = static_cast<uint64_t>(params->num_max_tokens_per_rank);
+  const uint64_t topk = static_cast<uint64_t>(params->num_topk);
+  const uint64_t hidden = static_cast<uint64_t>(params->hidden);
+  const uint64_t intermediate = static_cast<uint64_t>(params->intermediate_hidden);
+  uint64_t max_recv_tokens = 0, routed_tokens = 0, padding = 0, max_pool_tokens = 0;
+  if (!checked_mul_u64(ranks, max_tokens, &max_recv_tokens) ||
+      !checked_mul_u64(max_recv_tokens, std::min(topk, experts_per_rank), &routed_tokens) ||
+      !checked_mul_u64(experts_per_rank, 191, &padding) ||
+      !checked_add_u64(routed_tokens, padding, &max_pool_tokens) ||
+      !align_u64(max_pool_tokens, 384, &max_pool_tokens)) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 FP8 Mega MoE pool size overflowed");
+  }
+  const uint64_t padded_sf_tokens = (max_pool_tokens / 64) * 128;
+
+  uint64_t workspace_bytes = 128;
+  auto append_workspace = [&](uint64_t count, uint64_t bytes) {
+    uint64_t term = 0;
+    return checked_mul_u64(count, bytes, &term) &&
+        checked_add_u64(workspace_bytes, term, &workspace_bytes);
+  };
+  uint64_t dispatch_entries = 0;
+  if (!append_workspace(experts, 16) ||
+      !append_workspace(experts_per_rank, 8) ||
+      !append_workspace(max_pool_tokens / 8, 16) ||
+      !append_workspace((max_tokens + 7) / 8, 4) ||
+      !checked_mul_u64(experts_per_rank, ranks, &dispatch_entries) ||
+      !checked_mul_u64(dispatch_entries, max_recv_tokens, &dispatch_entries) ||
+      !append_workspace(dispatch_entries, 4) ||
+      !append_workspace(max_pool_tokens, 12) ||
+      !align_u64(workspace_bytes, 16, &workspace_bytes)) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 FP8 Mega MoE workspace size overflowed");
+  }
+
+  *out = {};
+  out->workspace_bytes = workspace_bytes;
+  uint64_t offset = workspace_bytes;
+  const auto append = [&](deepgemm_dtype_t dtype, uint64_t rows, uint64_t cols,
+                          uint64_t stride_rows, uint64_t stride_cols,
+                          deepgemm_mega_moe_buffer_view_t* view) {
+    return append_mega_moe_view(&offset, dtype, rows, cols, stride_rows, stride_cols, view);
+  };
+  if (!append(DEEPGEMM_DTYPE_FP8_E4M3, max_tokens, hidden, hidden, 1, &out->x) ||
+      !append(DEEPGEMM_DTYPE_F32, max_tokens, hidden / 128, hidden / 128, 1, &out->x_scale) ||
+      !append(DEEPGEMM_DTYPE_I64, max_tokens, topk, topk, 1, &out->topk_indices) ||
+      !append(DEEPGEMM_DTYPE_F32, max_tokens, topk, topk, 1, &out->topk_weights) ||
+      !append(DEEPGEMM_DTYPE_FP8_E4M3, max_pool_tokens, hidden, hidden, 1, &out->l1_acts) ||
+      !append(DEEPGEMM_DTYPE_F32, padded_sf_tokens, hidden / 128, 1, padded_sf_tokens, &out->l1_acts_scale)) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 FP8 Mega MoE L1 layout overflowed");
+  }
+  uint64_t l1_topk_weight_bytes = 0;
+  if (!checked_mul_u64(max_pool_tokens, 4, &l1_topk_weight_bytes) ||
+      !checked_add_u64(offset, l1_topk_weight_bytes, &offset) ||
+      !append(DEEPGEMM_DTYPE_FP8_E4M3, max_pool_tokens, intermediate, intermediate, 1, &out->l2_acts) ||
+      !append(DEEPGEMM_DTYPE_F32, padded_sf_tokens, intermediate / 64, 1, padded_sf_tokens, &out->l2_acts_scale) ||
+      !append(DEEPGEMM_DTYPE_BF16, max_tokens * topk, hidden, hidden, 1, &out->combine)) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "SM90 FP8 Mega MoE L2 layout overflowed");
+  }
+  out->total_bytes = offset;
+  return clear_error();
+}
+
 extern "C" deepgemm_status_t deepgemm_fp8_fp4_mqa_logits(
     const deepgemm_mqa_logits_params_t* params) {
   if (params == nullptr) {
@@ -847,5 +926,25 @@ extern "C" deepgemm_status_t deepgemm_bf16_mega_moe(
   }
   return ffi_call([&]() {
     deepgemm_rs::launch_bf16_mega_moe(*params);
+  });
+}
+
+extern "C" deepgemm_status_t deepgemm_sm90_fp8_mega_moe(
+    const deepgemm_sm90_fp8_mega_moe_params_t* params) {
+  if (params == nullptr) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "params must not be null");
+  }
+  return ffi_call([&]() {
+    deepgemm_rs::launch_sm90_fp8_mega_moe(*params);
+  });
+}
+
+extern "C" deepgemm_status_t deepgemm_fp8_mega_moe_interleave_l1_weights(
+    const deepgemm_fp8_mega_moe_interleave_params_t* params) {
+  if (params == nullptr) {
+    return set_error(DEEPGEMM_STATUS_INVALID_ARGUMENT, "params must not be null");
+  }
+  return ffi_call([&]() {
+    deepgemm_rs::launch_fp8_mega_moe_interleave_l1_weights(*params);
   });
 }

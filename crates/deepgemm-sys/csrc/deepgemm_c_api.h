@@ -53,6 +53,7 @@ typedef enum deepgemm_mega_moe_mma_kind_t {
   DEEPGEMM_MEGA_MOE_MMA_INVALID = 0,
   DEEPGEMM_MEGA_MOE_MMA_FP8_FP4 = 1,
   DEEPGEMM_MEGA_MOE_MMA_BF16 = 2,
+  DEEPGEMM_MEGA_MOE_MMA_FP8_FP8_SM90 = 3,
 } deepgemm_mega_moe_mma_kind_t;
 
 typedef void* deepgemm_cuda_stream_t;
@@ -262,6 +263,43 @@ typedef struct deepgemm_bf16_mega_moe_params_t {
   deepgemm_cuda_stream_t stream;
 } deepgemm_bf16_mega_moe_params_t;
 
+typedef struct deepgemm_sm90_fp8_mega_moe_params_t {
+  deepgemm_tensor_t x;
+  deepgemm_tensor_t x_scale;
+  deepgemm_tensor_t topk_indices;
+  deepgemm_tensor_t topk_weights;
+  deepgemm_tensor_t l1_weights;
+  deepgemm_tensor_t l1_weights_scale;
+  deepgemm_tensor_t l2_weights;
+  deepgemm_tensor_t l2_weights_scale;
+  deepgemm_tensor_mut_t y;
+  deepgemm_tensor_mut_t sym_buffer;
+  const uint64_t* sym_buffer_ptrs;
+  int32_t num_ranks;
+  int32_t rank_idx;
+  int32_t num_max_tokens_per_rank;
+  int32_t num_experts;
+  int32_t num_topk;
+  uint64_t x_offset_bytes;
+  uint64_t x_scale_offset_bytes;
+  uint64_t topk_indices_offset_bytes;
+  uint64_t topk_weights_offset_bytes;
+  uint64_t l1_acts_offset_bytes;
+  uint64_t l1_acts_scale_offset_bytes;
+  uint64_t l2_acts_offset_bytes;
+  uint64_t l2_acts_scale_offset_bytes;
+  float activation_clamp;
+  bool fast_math;
+  deepgemm_cuda_stream_t stream;
+} deepgemm_sm90_fp8_mega_moe_params_t;
+
+typedef struct deepgemm_fp8_mega_moe_interleave_params_t {
+  deepgemm_tensor_t weights;
+  deepgemm_tensor_mut_t output;
+  bool input_up_gate;
+  deepgemm_cuda_stream_t stream;
+} deepgemm_fp8_mega_moe_interleave_params_t;
+
 const char* deepgemm_last_error(void);
 
 deepgemm_status_t deepgemm_init(
@@ -328,6 +366,11 @@ deepgemm_status_t deepgemm_mega_moe_buffer_layout(
   deepgemm_mega_moe_buffer_layout_t* out
 );
 
+deepgemm_status_t deepgemm_sm90_fp8_mega_moe_buffer_layout(
+  const deepgemm_mega_moe_buffer_params_t* params,
+  deepgemm_mega_moe_buffer_layout_t* out
+);
+
 deepgemm_status_t deepgemm_fp8_fp4_mqa_logits(
   const deepgemm_mqa_logits_params_t* params
 );
@@ -354,6 +397,14 @@ deepgemm_status_t deepgemm_bf16_m_grouped_gemm_nt_contiguous(
 
 deepgemm_status_t deepgemm_bf16_mega_moe(
   const deepgemm_bf16_mega_moe_params_t* params
+);
+
+deepgemm_status_t deepgemm_sm90_fp8_mega_moe(
+  const deepgemm_sm90_fp8_mega_moe_params_t* params
+);
+
+deepgemm_status_t deepgemm_fp8_mega_moe_interleave_l1_weights(
+  const deepgemm_fp8_mega_moe_interleave_params_t* params
 );
 
 #ifdef __cplusplus

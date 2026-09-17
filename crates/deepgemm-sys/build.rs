@@ -27,6 +27,7 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc/deepgemm_raw_grouped_gemm.cc");
     println!("cargo:rerun-if-changed=csrc/deepgemm_raw_mega_moe.h");
     println!("cargo:rerun-if-changed=csrc/deepgemm_raw_mega_moe.cc");
+    println!("cargo:rerun-if-changed=csrc/deepgemm_raw_sm90_fp8_mega_moe.cc");
     println!(
         "cargo:rerun-if-changed={}",
         deepgemm_root.join("deep_gemm").join("include").display()
@@ -73,6 +74,11 @@ fn main() {
                 .join("deepgemm_raw_grouped_gemm.cc"),
         )
         .file(manifest_dir.join("csrc").join("deepgemm_raw_mega_moe.cc"));
+    build.file(
+        manifest_dir
+            .join("csrc")
+            .join("deepgemm_raw_sm90_fp8_mega_moe.cc"),
+    );
     build.compile("deepgemm_c_api");
 }
 

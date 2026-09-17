@@ -19,7 +19,11 @@ pub use gemm::{
     bf16_m_grouped_gemm_nt_contiguous, bf16_m_grouped_gemm_nt_contiguous_into, fp8_gemm_nt,
     fp8_gemm_nt_prepared_scales, prepare_fp8_gemm_scale,
 };
-pub use mega_moe::{Bf16MegaMoeWorkspace, bf16_mega_moe, interleave_bf16_mega_moe_l1_weights};
+pub use mega_moe::{
+    Bf16MegaMoeWorkspace, Sm90Fp8MegaMoeWorkspace, bf16_mega_moe,
+    interleave_bf16_mega_moe_l1_weights, interleave_mega_moe_l1_weights,
+    interleave_up_gate_fp8_mega_moe_l1_weights, sm90_fp8_mega_moe,
+};
 pub use mqa::{
     MqaLogitsConfig, PagedMqaLogitsConfig, PagedMqaLogitsPlan, fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits, paged_mqa_logits_plan,

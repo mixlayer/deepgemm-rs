@@ -21,6 +21,8 @@ pub enum MegaMoeMmaKind {
     Fp8Fp4,
     /// BF16 activations and expert weights.
     Bf16,
+    /// Hopper FP8 activations and FP8 expert weights with F32 block scales.
+    Fp8Fp8Sm90,
 }
 
 impl MegaMoeMmaKind {
@@ -28,6 +30,7 @@ impl MegaMoeMmaKind {
         match self {
             Self::Fp8Fp4 => deepgemm_sys::DEEPGEMM_MEGA_MOE_MMA_FP8_FP4,
             Self::Bf16 => deepgemm_sys::DEEPGEMM_MEGA_MOE_MMA_BF16,
+            Self::Fp8Fp8Sm90 => deepgemm_sys::DEEPGEMM_MEGA_MOE_MMA_FP8_FP8_SM90,
         }
     }
 }
@@ -119,6 +122,223 @@ pub struct Bf16MegaMoeSpec {
     pub num_ring_tokens: usize,
     /// Exact symmetric-buffer allocation layout.
     pub buffer_layout: MegaMoeBufferLayout,
+}
+
+/// Static topology and symmetric-buffer layout for SM90 FP8 Mega MoE launches.
+#[derive(Debug, Copy, Clone)]
+pub struct Sm90Fp8MegaMoeSpec {
+    /// Global number of experts across all expert-parallel ranks.
+    pub num_experts: usize,
+    /// Number of experts selected for every token.
+    pub num_topk: usize,
+    /// Maximum input tokens accepted on each rank; must be 128-aligned.
+    pub num_max_tokens_per_rank: usize,
+    /// Exact symmetric-buffer allocation layout.
+    pub buffer_layout: MegaMoeBufferLayout,
+}
+
+/// Device pointers and runtime values for one SM90 FP8 Mega MoE launch.
+#[derive(Debug)]
+pub struct Sm90Fp8MegaMoeLaunch<'a> {
+    /// Contiguous FP8 E4M3 `[tokens, hidden]` input activations.
+    pub x: TensorArg<2>,
+    /// Contiguous F32 `[tokens, hidden / 128]` input scales.
+    pub x_scale: TensorArg<2>,
+    /// Contiguous I64 `[tokens, topk]` global expert indices.
+    pub topk_indices: TensorArg<2>,
+    /// Contiguous F32 `[tokens, topk]` normalized routing weights.
+    pub topk_weights: TensorArg<2>,
+    /// Contiguous FP8 `[local_experts, 2 * intermediate, hidden]` interleaved weights.
+    pub l1_weights: TensorArg<3>,
+    /// Contiguous F32 `[local_experts, 2 * intermediate / 128, hidden / 128]` scales.
+    pub l1_weights_scale: TensorArg<3>,
+    /// Contiguous FP8 `[local_experts, hidden, intermediate]` down weights.
+    pub l2_weights: TensorArg<3>,
+    /// Contiguous F32 `[local_experts, hidden / 128, intermediate / 128]` scales.
+    pub l2_weights_scale: TensorArg<3>,
+    /// Contiguous BF16 `[tokens, hidden]` output.
+    pub y: TensorOut<2>,
+    /// Contiguous U8 allocation described by `spec.buffer_layout`.
+    pub sym_buffer: TensorOut<1>,
+    /// Peer-visible symmetric allocation addresses for all ranks.
+    pub sym_buffer_ptrs: &'a [u64],
+    /// This process's expert-parallel rank.
+    pub rank_idx: usize,
+    /// Optional finite nonnegative SwiGLU clamp; infinity disables clamping.
+    pub activation_clamp: f32,
+    /// Enables the upstream fast-math implementation.
+    pub fast_math: bool,
+    /// CUDA stream handle; null selects the default stream.
+    pub stream: *mut c_void,
+}
+
+/// Launches DeepGEMM's fused Hopper FP8 Mega MoE kernels.
+pub fn sm90_fp8_mega_moe(
+    spec: &Sm90Fp8MegaMoeSpec,
+    launch: Sm90Fp8MegaMoeLaunch<'_>,
+) -> Result<()> {
+    validate_sm90_fp8_launch(spec, &launch)?;
+    let layout = &spec.buffer_layout;
+    let raw = deepgemm_sys::deepgemm_sm90_fp8_mega_moe_params_t {
+        x: launch.x.to_raw()?,
+        x_scale: launch.x_scale.to_raw()?,
+        topk_indices: launch.topk_indices.to_raw()?,
+        topk_weights: launch.topk_weights.to_raw()?,
+        l1_weights: launch.l1_weights.to_raw()?,
+        l1_weights_scale: launch.l1_weights_scale.to_raw()?,
+        l2_weights: launch.l2_weights.to_raw()?,
+        l2_weights_scale: launch.l2_weights_scale.to_raw()?,
+        y: launch.y.to_raw()?,
+        sym_buffer: launch.sym_buffer.to_raw()?,
+        sym_buffer_ptrs: launch.sym_buffer_ptrs.as_ptr(),
+        num_ranks: i32::try_from(launch.sym_buffer_ptrs.len())
+            .map_err(|_| Error::InvalidArgument("num_ranks does not fit i32".into()))?,
+        rank_idx: i32::try_from(launch.rank_idx)
+            .map_err(|_| Error::InvalidArgument("rank_idx does not fit i32".into()))?,
+        num_max_tokens_per_rank: i32::try_from(spec.num_max_tokens_per_rank).map_err(|_| {
+            Error::InvalidArgument("num_max_tokens_per_rank does not fit i32".into())
+        })?,
+        num_experts: i32::try_from(spec.num_experts)
+            .map_err(|_| Error::InvalidArgument("num_experts does not fit i32".into()))?,
+        num_topk: i32::try_from(spec.num_topk)
+            .map_err(|_| Error::InvalidArgument("num_topk does not fit i32".into()))?,
+        x_offset_bytes: layout.x.offset_bytes as u64,
+        x_scale_offset_bytes: layout.x_scale.expect("validated x scale").offset_bytes as u64,
+        topk_indices_offset_bytes: layout.topk_indices.offset_bytes as u64,
+        topk_weights_offset_bytes: layout.topk_weights.offset_bytes as u64,
+        l1_acts_offset_bytes: layout.l1_acts.offset_bytes as u64,
+        l1_acts_scale_offset_bytes: layout
+            .l1_acts_scale
+            .expect("validated L1 activation scale")
+            .offset_bytes as u64,
+        l2_acts_offset_bytes: layout.l2_acts.offset_bytes as u64,
+        l2_acts_scale_offset_bytes: layout
+            .l2_acts_scale
+            .expect("validated L2 activation scale")
+            .offset_bytes as u64,
+        activation_clamp: launch.activation_clamp,
+        fast_math: launch.fast_math,
+        stream: launch.stream,
+    };
+    // SAFETY: descriptors and pointer table remain alive for this synchronous FFI call.
+    let status = unsafe { deepgemm_sys::deepgemm_sm90_fp8_mega_moe(&raw) };
+    Error::check_raw_status(status)
+}
+
+/// Interleaves CUDA FP8 L1 gate/up rows in DeepGEMM's eight-row layout.
+///
+/// `weights` and `output` are contiguous FP8 E4M3
+/// `[experts, 2 * intermediate, hidden]` tensors with identical shapes. The
+/// kernel fully overwrites `output` on `stream`.
+pub fn fp8_mega_moe_interleave_l1_weights(
+    weights: TensorArg<3>,
+    output: TensorOut<3>,
+    input_up_gate: bool,
+    stream: *mut c_void,
+) -> Result<()> {
+    require_dtype(&weights.spec, DType::Fp8E4M3, "weights")?;
+    require_dtype(&output.spec, DType::Fp8E4M3, "output")?;
+    require_contiguous(&weights.spec, "weights")?;
+    require_contiguous(&output.spec, "output")?;
+    if weights.spec.shape != output.spec.shape
+        || weights.spec.shape[1] == 0
+        || weights.spec.shape[1] % 16 != 0
+    {
+        return Err(Error::InvalidArgument(
+            "FP8 Mega MoE interleave tensor shapes are invalid".into(),
+        ));
+    }
+    let raw = deepgemm_sys::deepgemm_fp8_mega_moe_interleave_params_t {
+        weights: weights.to_raw()?,
+        output: output.to_raw()?,
+        input_up_gate,
+        stream,
+    };
+    // SAFETY: tensor descriptors remain valid for this synchronous FFI call.
+    let status = unsafe { deepgemm_sys::deepgemm_fp8_mega_moe_interleave_l1_weights(&raw) };
+    Error::check_raw_status(status)
+}
+
+fn validate_sm90_fp8_launch(
+    spec: &Sm90Fp8MegaMoeSpec,
+    launch: &Sm90Fp8MegaMoeLaunch<'_>,
+) -> Result<()> {
+    for (tensor, dtype, name) in [
+        (&launch.x.spec, DType::Fp8E4M3, "x"),
+        (&launch.x_scale.spec, DType::F32, "x_scale"),
+        (&launch.topk_indices.spec, DType::I64, "topk_indices"),
+        (&launch.topk_weights.spec, DType::F32, "topk_weights"),
+    ] {
+        require_dtype(tensor, dtype, name)?;
+        require_contiguous(tensor, name)?;
+    }
+    for (tensor, dtype, name) in [
+        (&launch.l1_weights.spec, DType::Fp8E4M3, "l1_weights"),
+        (
+            &launch.l1_weights_scale.spec,
+            DType::F32,
+            "l1_weights_scale",
+        ),
+        (&launch.l2_weights.spec, DType::Fp8E4M3, "l2_weights"),
+        (
+            &launch.l2_weights_scale.spec,
+            DType::F32,
+            "l2_weights_scale",
+        ),
+    ] {
+        require_dtype(tensor, dtype, name)?;
+        require_contiguous(tensor, name)?;
+    }
+    require_dtype(&launch.y.spec, DType::BF16, "y")?;
+    require_dtype(&launch.sym_buffer.spec, DType::U8, "sym_buffer")?;
+    require_contiguous(&launch.y.spec, "y")?;
+    require_contiguous(&launch.sym_buffer.spec, "sym_buffer")?;
+
+    let [tokens, hidden] = launch.x.spec.shape;
+    let [local_experts, twice_intermediate, l1_hidden] = launch.l1_weights.spec.shape;
+    let [l2_experts, l2_hidden, intermediate] = launch.l2_weights.spec.shape;
+    if tokens == 0
+        || tokens > spec.num_max_tokens_per_rank
+        || hidden == 0
+        || hidden % 256 != 0
+        || intermediate == 0
+        || intermediate % 128 != 0
+        || intermediate.checked_mul(2) != Some(twice_intermediate)
+        || l1_hidden != hidden
+        || l2_hidden != hidden
+        || l2_experts != local_experts
+        || local_experts.checked_mul(launch.sym_buffer_ptrs.len()) != Some(spec.num_experts)
+        || launch.x_scale.spec.shape != [tokens, hidden / 128]
+        || launch.topk_indices.spec.shape != [tokens, spec.num_topk]
+        || launch.topk_weights.spec.shape != [tokens, spec.num_topk]
+        || launch.l1_weights_scale.spec.shape
+            != [local_experts, twice_intermediate / 128, hidden / 128]
+        || launch.l2_weights_scale.spec.shape != [local_experts, hidden / 128, intermediate / 128]
+        || launch.y.spec.shape != [tokens, hidden]
+    {
+        return Err(Error::InvalidArgument(
+            "SM90 FP8 Mega MoE tensor shapes are inconsistent".into(),
+        ));
+    }
+    if spec.num_topk == 0
+        || spec.num_max_tokens_per_rank % 128 != 0
+        || launch.sym_buffer_ptrs.is_empty()
+        || launch.rank_idx >= launch.sym_buffer_ptrs.len()
+        || launch.sym_buffer.spec.shape != [spec.buffer_layout.total_bytes]
+        || spec.buffer_layout.x_scale.is_none()
+        || spec.buffer_layout.l1_acts_scale.is_none()
+        || spec.buffer_layout.l2_acts_scale.is_none()
+    {
+        return Err(Error::InvalidArgument(
+            "SM90 FP8 Mega MoE launch topology or buffer is invalid".into(),
+        ));
+    }
+    if launch.activation_clamp.is_nan() || launch.activation_clamp.is_sign_negative() {
+        return Err(Error::InvalidArgument(
+            "activation_clamp must be nonnegative".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Device pointers and runtime values for one BF16 Mega MoE launch.
@@ -332,6 +552,49 @@ pub fn mega_moe_buffer_layout(config: MegaMoeBufferConfig) -> Result<MegaMoeBuff
     })
 }
 
+/// Derives the exact symmetric-buffer layout used by Hopper FP8 Mega MoE.
+pub fn sm90_fp8_mega_moe_buffer_layout(config: MegaMoeBufferConfig) -> Result<MegaMoeBufferLayout> {
+    let params = deepgemm_sys::deepgemm_mega_moe_buffer_params_t {
+        num_ranks: usize_to_i64(config.num_ranks, "num_ranks")?,
+        num_experts: usize_to_i64(config.num_experts, "num_experts")?,
+        num_max_tokens_per_rank: usize_to_i64(
+            config.num_max_tokens_per_rank,
+            "num_max_tokens_per_rank",
+        )?,
+        num_topk: usize_to_i64(config.num_topk, "num_topk")?,
+        hidden: usize_to_i64(config.hidden, "hidden")?,
+        intermediate_hidden: usize_to_i64(config.intermediate_hidden, "intermediate_hidden")?,
+        num_ring_tokens: 0,
+        mma_kind: MegaMoeMmaKind::Fp8Fp8Sm90.to_sys(),
+    };
+    let mut raw = MaybeUninit::<deepgemm_sys::deepgemm_mega_moe_buffer_layout_t>::uninit();
+    // SAFETY: `params` and writable output storage are valid for the call.
+    let status = unsafe {
+        deepgemm_sys::deepgemm_sm90_fp8_mega_moe_buffer_layout(&params, raw.as_mut_ptr())
+    };
+    Error::check_raw_status(status)?;
+    // SAFETY: the C ABI initializes the complete output on success.
+    raw_layout_from_sys(unsafe { raw.assume_init() })
+}
+
+fn raw_layout_from_sys(
+    raw: deepgemm_sys::deepgemm_mega_moe_buffer_layout_t,
+) -> Result<MegaMoeBufferLayout> {
+    Ok(MegaMoeBufferLayout {
+        total_bytes: usize_from_u64(raw.total_bytes, "total buffer bytes")?,
+        workspace_bytes: usize_from_u64(raw.workspace_bytes, "workspace bytes")?,
+        x: view_from_sys(raw.x, "x")?,
+        x_scale: optional_view_from_sys(raw.x_scale, "x_scale")?,
+        topk_indices: view_from_sys(raw.topk_indices, "topk_indices")?,
+        topk_weights: view_from_sys(raw.topk_weights, "topk_weights")?,
+        l1_acts: view_from_sys(raw.l1_acts, "l1_acts")?,
+        l1_acts_scale: optional_view_from_sys(raw.l1_acts_scale, "l1_acts_scale")?,
+        l2_acts: view_from_sys(raw.l2_acts, "l2_acts")?,
+        l2_acts_scale: optional_view_from_sys(raw.l2_acts_scale, "l2_acts_scale")?,
+        combine: view_from_sys(raw.combine, "combine")?,
+    })
+}
+
 fn optional_view_from_sys(
     raw: deepgemm_sys::deepgemm_mega_moe_buffer_view_t,
     name: &str,
@@ -445,6 +708,28 @@ mod tests {
         assert_eq!(layout.l2_acts_scale, None);
         assert_eq!(layout.l2_acts.shape, [384, 128]);
         assert_eq!(layout.total_bytes, 543200);
+    }
+
+    #[test]
+    fn derives_sm90_fp8_symmetric_buffer_views() {
+        let config = MegaMoeBufferConfig {
+            num_ranks: 1,
+            num_experts: 256,
+            num_max_tokens_per_rank: 128,
+            num_topk: 8,
+            hidden: 6144,
+            intermediate_hidden: 2048,
+            num_ring_tokens: 0,
+            mma_kind: MegaMoeMmaKind::Fp8Fp8Sm90,
+        };
+        let layout = sm90_fp8_mega_moe_buffer_layout(config).unwrap();
+        assert_eq!(layout.x.shape, [128, 6144]);
+        assert_eq!(layout.x_scale.unwrap().shape, [128, 48]);
+        assert_eq!(layout.l1_acts.shape[0] % 384, 0);
+        assert_eq!(layout.l1_acts_scale.unwrap().strides[0], 1);
+        assert_eq!(layout.l1_acts_scale.unwrap().shape[1], 48);
+        assert_eq!(layout.l2_acts_scale.unwrap().shape[1], 32);
+        assert_eq!(layout.combine.shape, [1024, 6144]);
     }
 
     #[test]
