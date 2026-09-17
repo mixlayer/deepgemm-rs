@@ -9,6 +9,8 @@ pub mod dtype;
 pub mod error;
 /// Dense FP8 GEMM shape validation, scale transforms, and launches.
 pub mod gemm;
+/// Mega MoE symmetric-buffer planning.
+pub mod mega_moe;
 /// MQA logits shape validation and layout helpers.
 pub mod mqa;
 /// Runtime initialization helpers.
@@ -22,8 +24,14 @@ pub use arch::Arch;
 pub use dtype::DType;
 pub use error::{Error, Result};
 pub use gemm::{
-    Fp8GemmNtLaunch, Fp8GemmNtSpec, Fp8GemmScaleTransformLaunch, Fp8GemmScaleTransformSpec,
-    fp8_gemm_nt, fp8_gemm_nt_output_layout, fp8_gemm_scale_layout, fp8_gemm_transform_scale,
+    Bf16MGroupedGemmNtLaunch, Fp8GemmNtLaunch, Fp8GemmNtSpec, Fp8GemmScaleTransformLaunch,
+    Fp8GemmScaleTransformSpec, bf16_m_grouped_gemm_nt_contiguous, fp8_gemm_nt,
+    fp8_gemm_nt_output_layout, fp8_gemm_scale_layout, fp8_gemm_transform_scale,
+};
+pub use mega_moe::{
+    Bf16MegaMoeLaunch, Bf16MegaMoeSpec, MegaMoeBufferConfig, MegaMoeBufferLayout,
+    MegaMoeBufferView, MegaMoeMmaKind, MegaMoeRingConfig, MegaMoeRingLimits, bf16_mega_moe,
+    mega_moe_buffer_layout, mega_moe_ring_limits, mega_moe_token_alignment,
 };
 pub use mqa::{
     MqaLogitsLaunch, MqaLogitsSpec, PagedMqaLogitsLaunch, PagedMqaLogitsMetadataLaunch,
