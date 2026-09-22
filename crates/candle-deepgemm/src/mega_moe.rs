@@ -1,10 +1,17 @@
-//! Candle CUDA integration for DeepGEMM BF16 Mega MoE.
+//! Candle CUDA integration for DeepGEMM BF16 and SM90 FP8 Mega MoE.
 
-use candle::{DType as CandleDType, Tensor};
+use candle::{
+    DType as CandleDType, Tensor,
+    cuda::cudarc::driver::{
+        CudaStream,
+        sys::{self, CUdeviceptr, CUipcMem_flags_enum, CUipcMemHandle_st},
+    },
+};
 use deepgemm::{
     Bf16MegaMoeLaunch, Bf16MegaMoeSpec, DType as DeepGemmDType, Sm90Fp8MegaMoeLaunch,
     Sm90Fp8MegaMoeSpec, TensorArg, TensorOut, TensorSpec,
 };
+use std::{ffi::c_char, sync::Arc};
 
 use crate::{
     Result,
@@ -25,25 +32,125 @@ pub struct Bf16MegaMoeWorkspace {
     buffer: Tensor,
 }
 
-/// A reusable single-rank symmetric allocation for Hopper FP8 Mega MoE.
+/// Number of opaque bytes in a CUDA IPC memory handle.
+pub const SM90_FP8_MEGA_MOE_IPC_HANDLE_BYTES: usize = 64;
+
+/// Serializable CUDA IPC handle for one rank's SM90 FP8 Mega MoE allocation.
+pub type Sm90Fp8MegaMoeIpcHandle = [u8; SM90_FP8_MEGA_MOE_IPC_HANDLE_BYTES];
+
+#[derive(Debug)]
+enum Sm90Fp8MegaMoeBuffer {
+    SingleRank(Tensor),
+    Distributed(Sm90Fp8MegaMoeIpcBuffer),
+}
+
+/// A reusable local or CUDA-IPC symmetric allocation for Hopper FP8 Mega MoE.
 #[derive(Debug)]
 pub struct Sm90Fp8MegaMoeWorkspace {
     spec: Sm90Fp8MegaMoeSpec,
-    buffer: Tensor,
+    buffer: Sm90Fp8MegaMoeBuffer,
+}
+
+/// An allocated SM90 FP8 buffer waiting for peer CUDA IPC handles.
+///
+/// Every rank must allocate one pending workspace, exchange [`Self::ipc_handle`]
+/// in rank order, and call [`Self::connect`] with the complete handle table.
+#[derive(Debug)]
+pub struct PendingSm90Fp8MegaMoeWorkspace {
+    spec: Sm90Fp8MegaMoeSpec,
+    rank_idx: usize,
+    world_size: usize,
+    local_ptr: CUdeviceptr,
+    ipc_handle: Sm90Fp8MegaMoeIpcHandle,
+    stream: Arc<CudaStream>,
+}
+
+#[derive(Debug)]
+struct Sm90Fp8MegaMoeIpcBuffer {
+    rank_idx: usize,
+    local_ptr: CUdeviceptr,
+    imported_peer_ptrs: Vec<CUdeviceptr>,
+    peer_ptrs: Vec<u64>,
+    stream: Arc<CudaStream>,
 }
 
 impl Sm90Fp8MegaMoeWorkspace {
     /// Allocates a zero-initialized single-rank SM90 FP8 symmetric buffer.
     pub fn new_single_rank(spec: Sm90Fp8MegaMoeSpec, device: &candle::Device) -> Result<Self> {
-        if spec.num_experts == 0
-            || spec.num_topk == 0
-            || spec.num_max_tokens_per_rank == 0
-            || spec.buffer_layout.total_bytes == 0
-        {
-            return invalid_arg("SM90 FP8 Mega MoE workspace dimensions must be positive");
-        }
+        validate_sm90_fp8_workspace_spec(&spec)?;
         let buffer = Tensor::zeros((spec.buffer_layout.total_bytes,), CandleDType::U8, device)?;
-        Ok(Self { spec, buffer })
+        Ok(Self {
+            spec,
+            buffer: Sm90Fp8MegaMoeBuffer::SingleRank(buffer),
+        })
+    }
+
+    /// Allocates this rank's CUDA-IPC-exportable symmetric buffer.
+    ///
+    /// `rank_idx` is this process's rank in a `world_size` expert-parallel
+    /// group. The allocation uses `cuMemAlloc` because CUDA IPC handles cannot
+    /// be exported from cudarc's stream-ordered memory pool.
+    pub fn begin_distributed(
+        spec: Sm90Fp8MegaMoeSpec,
+        rank_idx: usize,
+        world_size: usize,
+        device: &candle::Device,
+    ) -> Result<PendingSm90Fp8MegaMoeWorkspace> {
+        validate_sm90_fp8_workspace_spec(&spec)?;
+        if world_size <= 1 || rank_idx >= world_size || spec.num_experts % world_size != 0 {
+            return invalid_arg(format!(
+                "distributed SM90 FP8 Mega MoE requires world_size > 1, rank_idx < world_size, and experts divisible by world_size; got experts={}, rank_idx={rank_idx}, world_size={world_size}",
+                spec.num_experts
+            ));
+        }
+
+        let stream = device.as_cuda_device()?.cuda_stream();
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(cuda_driver_error("bind CUDA context"))?;
+
+        let mut local_ptr: CUdeviceptr = 0;
+        check_cuda(
+            // SAFETY: `local_ptr` is writable and the requested allocation size was validated.
+            unsafe { sys::cuMemAlloc_v2(&mut local_ptr, spec.buffer_layout.total_bytes) },
+            "allocate CUDA-IPC SM90 FP8 Mega MoE buffer",
+        )?;
+        let mut pending = PendingSm90Fp8MegaMoeWorkspace {
+            spec,
+            rank_idx,
+            world_size,
+            local_ptr,
+            ipc_handle: [0; SM90_FP8_MEGA_MOE_IPC_HANDLE_BYTES],
+            stream,
+        };
+        check_cuda(
+            // SAFETY: `local_ptr` owns at least `total_bytes` writable device bytes.
+            unsafe {
+                sys::cuMemsetD8Async(
+                    pending.local_ptr,
+                    0,
+                    pending.spec.buffer_layout.total_bytes,
+                    pending.stream.cu_stream(),
+                )
+            },
+            "zero CUDA-IPC SM90 FP8 Mega MoE buffer",
+        )?;
+        pending
+            .stream
+            .synchronize()
+            .map_err(cuda_driver_error("synchronize initialized CUDA-IPC buffer"))?;
+
+        let mut handle = CUipcMemHandle_st {
+            reserved: [0 as c_char; SM90_FP8_MEGA_MOE_IPC_HANDLE_BYTES],
+        };
+        check_cuda(
+            // SAFETY: `handle` is writable and `local_ptr` is a live `cuMemAlloc` allocation.
+            unsafe { sys::cuIpcGetMemHandle(&mut handle, pending.local_ptr) },
+            "export SM90 FP8 Mega MoE CUDA IPC handle",
+        )?;
+        pending.ipc_handle = ipc_handle_to_bytes(handle);
+        Ok(pending)
     }
 
     /// Returns the immutable launch specification associated with this allocation.
@@ -54,6 +161,162 @@ impl Sm90Fp8MegaMoeWorkspace {
     /// Returns the backing symmetric allocation size in bytes.
     pub fn allocation_bytes(&self) -> usize {
         self.spec.buffer_layout.total_bytes
+    }
+
+    /// Returns the expert-parallel rank represented by this workspace.
+    pub fn rank_idx(&self) -> usize {
+        match &self.buffer {
+            Sm90Fp8MegaMoeBuffer::SingleRank(_) => 0,
+            Sm90Fp8MegaMoeBuffer::Distributed(buffer) => buffer.rank_idx,
+        }
+    }
+
+    /// Returns the number of peer-visible symmetric allocations.
+    pub fn world_size(&self) -> usize {
+        match &self.buffer {
+            Sm90Fp8MegaMoeBuffer::SingleRank(_) => 1,
+            Sm90Fp8MegaMoeBuffer::Distributed(buffer) => buffer.peer_ptrs.len(),
+        }
+    }
+}
+
+impl PendingSm90Fp8MegaMoeWorkspace {
+    /// Returns this rank's opaque CUDA IPC handle for all-gather.
+    pub fn ipc_handle(&self) -> Sm90Fp8MegaMoeIpcHandle {
+        self.ipc_handle
+    }
+
+    /// Opens every remote rank's allocation and completes the workspace.
+    ///
+    /// `peer_handles` must contain exactly one handle per rank in communicator
+    /// rank order, including this rank's own handle at `rank_idx`.
+    pub fn connect(
+        mut self,
+        peer_handles: &[Sm90Fp8MegaMoeIpcHandle],
+    ) -> Result<Sm90Fp8MegaMoeWorkspace> {
+        if peer_handles.len() != self.world_size {
+            return invalid_arg(format!(
+                "SM90 FP8 Mega MoE received {} CUDA IPC handles for world_size {}",
+                peer_handles.len(),
+                self.world_size
+            ));
+        }
+        if peer_handles[self.rank_idx] != self.ipc_handle {
+            return invalid_arg("SM90 FP8 Mega MoE CUDA IPC handles are not in rank order");
+        }
+        self.stream
+            .context()
+            .bind_to_thread()
+            .map_err(cuda_driver_error("bind CUDA context for IPC peer import"))?;
+
+        let mut imported_peer_ptrs = Vec::with_capacity(self.world_size - 1);
+        let mut peer_ptrs = Vec::with_capacity(self.world_size);
+        for (peer_rank, peer_handle) in peer_handles.iter().enumerate() {
+            if peer_rank == self.rank_idx {
+                peer_ptrs.push(self.local_ptr as u64);
+                continue;
+            }
+            let mut peer_ptr: CUdeviceptr = 0;
+            let handle = ipc_handle_from_bytes(*peer_handle);
+            let status = unsafe {
+                // SAFETY: `peer_ptr` is writable and `handle` came from a live peer allocation.
+                sys::cuIpcOpenMemHandle_v2(
+                    &mut peer_ptr,
+                    handle,
+                    CUipcMem_flags_enum::CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS as u32,
+                )
+            };
+            if let Err(error) = check_cuda(status, "open SM90 FP8 Mega MoE CUDA IPC peer") {
+                close_imported_peers(&imported_peer_ptrs);
+                return Err(error);
+            }
+            imported_peer_ptrs.push(peer_ptr);
+            peer_ptrs.push(peer_ptr as u64);
+        }
+
+        let local_ptr = self.local_ptr;
+        self.local_ptr = 0;
+        Ok(Sm90Fp8MegaMoeWorkspace {
+            spec: self.spec,
+            buffer: Sm90Fp8MegaMoeBuffer::Distributed(Sm90Fp8MegaMoeIpcBuffer {
+                rank_idx: self.rank_idx,
+                local_ptr,
+                imported_peer_ptrs,
+                peer_ptrs,
+                stream: self.stream.clone(),
+            }),
+        })
+    }
+}
+
+impl Drop for PendingSm90Fp8MegaMoeWorkspace {
+    fn drop(&mut self) {
+        if self.local_ptr == 0 {
+            return;
+        }
+        let _ = self.stream.context().bind_to_thread();
+        // SAFETY: this pending allocation was created by `cuMemAlloc_v2` and was not transferred.
+        unsafe {
+            let _ = sys::cuMemFree_v2(self.local_ptr);
+        }
+    }
+}
+
+impl Drop for Sm90Fp8MegaMoeIpcBuffer {
+    fn drop(&mut self) {
+        let _ = self.stream.context().bind_to_thread();
+        let _ = self.stream.context().synchronize();
+        close_imported_peers(&self.imported_peer_ptrs);
+        if self.local_ptr != 0 {
+            // SAFETY: the local allocation was created by `cuMemAlloc_v2` and is owned here.
+            unsafe {
+                let _ = sys::cuMemFree_v2(self.local_ptr);
+            }
+        }
+    }
+}
+
+fn validate_sm90_fp8_workspace_spec(spec: &Sm90Fp8MegaMoeSpec) -> Result<()> {
+    if spec.num_experts == 0
+        || spec.num_topk == 0
+        || spec.num_max_tokens_per_rank == 0
+        || spec.buffer_layout.total_bytes == 0
+    {
+        return invalid_arg("SM90 FP8 Mega MoE workspace dimensions must be positive");
+    }
+    Ok(())
+}
+
+fn check_cuda(status: sys::CUresult, operation: &'static str) -> Result<()> {
+    if status == sys::cudaError_enum::CUDA_SUCCESS {
+        Ok(())
+    } else {
+        invalid_arg(format!("{operation} failed: {status:?}"))
+    }
+}
+
+fn cuda_driver_error<E: std::fmt::Debug>(
+    operation: &'static str,
+) -> impl FnOnce(E) -> crate::Error {
+    move |error| crate::Error::Tensor(format!("{operation} failed: {error:?}"))
+}
+
+fn ipc_handle_to_bytes(handle: CUipcMemHandle_st) -> Sm90Fp8MegaMoeIpcHandle {
+    handle.reserved.map(|byte| byte as u8)
+}
+
+fn ipc_handle_from_bytes(bytes: Sm90Fp8MegaMoeIpcHandle) -> CUipcMemHandle_st {
+    CUipcMemHandle_st {
+        reserved: bytes.map(|byte| byte as c_char),
+    }
+}
+
+fn close_imported_peers(peer_ptrs: &[CUdeviceptr]) {
+    for peer_ptr in peer_ptrs.iter().copied() {
+        // SAFETY: every pointer in this slice was returned by `cuIpcOpenMemHandle_v2`.
+        unsafe {
+            let _ = sys::cuIpcCloseMemHandle(peer_ptr);
+        }
     }
 }
 
@@ -207,10 +470,10 @@ fn interleave_mega_moe_l1_weights_impl(weights: &Tensor, input_up_gate: bool) ->
 /// - `x_scale`: contiguous F32 `[tokens, hidden / 128]`.
 /// - `topk_indices`: contiguous I64 `[tokens, topk]` global expert IDs.
 /// - `topk_weights`: contiguous F32 `[tokens, topk]` routing weights.
-/// - `l1_weights`: interleaved FP8 `[experts, 2 * intermediate, hidden]`.
-/// - `l1_weights_scale`: F32 `[experts, 2 * intermediate / 128, hidden / 128]`.
-/// - `l2_weights`: FP8 `[experts, hidden, intermediate]`.
-/// - `l2_weights_scale`: F32 `[experts, hidden / 128, intermediate / 128]`.
+/// - `l1_weights`: interleaved FP8 `[local_experts, 2 * intermediate, hidden]`.
+/// - `l1_weights_scale`: F32 `[local_experts, 2 * intermediate / 128, hidden / 128]`.
+/// - `l2_weights`: FP8 `[local_experts, hidden, intermediate]`.
+/// - `l2_weights_scale`: F32 `[local_experts, hidden / 128, intermediate / 128]`.
 /// - returns contiguous BF16 `[tokens, hidden]`.
 pub fn sm90_fp8_mega_moe(
     workspace: &Sm90Fp8MegaMoeWorkspace,
@@ -231,9 +494,11 @@ pub fn sm90_fp8_mega_moe(
         ("l1_weights_scale", l1_weights_scale),
         ("l2_weights", l2_weights),
         ("l2_weights_scale", l2_weights_scale),
-        ("workspace", &workspace.buffer),
     ] {
         ensure_same_device(x, tensor, name)?;
+    }
+    if let Sm90Fp8MegaMoeBuffer::SingleRank(buffer) = &workspace.buffer {
+        ensure_same_device(x, buffer, "workspace")?;
     }
     for (tensor, rank, dtype, name) in [
         (x, 2, CandleDType::F8E4M3, "x"),
@@ -342,15 +607,42 @@ pub fn sm90_fp8_mega_moe(
             CandleDType::BF16,
             "output"
         );
-        tensor_ptr!(
-            buffer_ptr,
-            buffer_storage,
-            buffer_layout,
-            workspace.buffer,
-            CandleDType::U8,
-            "workspace"
-        );
-        let sym_buffer_ptrs = [buffer_ptr.as_mut_void() as usize as u64];
+        let single_rank_storage = match &workspace.buffer {
+            Sm90Fp8MegaMoeBuffer::SingleRank(buffer) => Some(buffer.storage_and_layout()),
+            Sm90Fp8MegaMoeBuffer::Distributed(buffer) => {
+                if buffer.stream.context().ordinal() != device_id as usize {
+                    return invalid_arg(format!(
+                        "workspace is on CUDA device {}, but input is on CUDA device {device_id}",
+                        buffer.stream.context().ordinal()
+                    ));
+                }
+                None
+            }
+        };
+        let single_rank_buffer_ptr = single_rank_storage
+            .as_ref()
+            .map(|(storage, layout)| {
+                tensor_ptr_by_dtype(
+                    storage,
+                    CandleDType::U8,
+                    layout.start_offset(),
+                    &stream,
+                    "workspace",
+                )
+            })
+            .transpose()?;
+        let local_buffer_ptr = match (&single_rank_buffer_ptr, &workspace.buffer) {
+            (Some(pointer), Sm90Fp8MegaMoeBuffer::SingleRank(_)) => {
+                pointer.as_mut_void() as usize as u64
+            }
+            (None, Sm90Fp8MegaMoeBuffer::Distributed(buffer)) => buffer.local_ptr as u64,
+            _ => unreachable!("workspace pointer variant mismatch"),
+        };
+        let single_rank_peer_ptrs = [local_buffer_ptr];
+        let peer_ptrs = match &workspace.buffer {
+            Sm90Fp8MegaMoeBuffer::SingleRank(_) => single_rank_peer_ptrs.as_slice(),
+            Sm90Fp8MegaMoeBuffer::Distributed(buffer) => buffer.peer_ptrs.as_slice(),
+        };
 
         let launch = Sm90Fp8MegaMoeLaunch {
             x: TensorArg {
@@ -390,11 +682,11 @@ pub fn sm90_fp8_mega_moe(
                 spec: tensor_spec(&output, DeepGemmDType::BF16, "output")?,
             },
             sym_buffer: TensorOut {
-                data: buffer_ptr.as_mut_void(),
+                data: local_buffer_ptr as usize as *mut std::ffi::c_void,
                 spec: TensorSpec::contiguous(DeepGemmDType::U8, [workspace.allocation_bytes()]),
             },
-            sym_buffer_ptrs: &sym_buffer_ptrs,
-            rank_idx: 0,
+            sym_buffer_ptrs: peer_ptrs,
+            rank_idx: workspace.rank_idx(),
             activation_clamp: f32::INFINITY,
             fast_math: true,
             stream: stream.cu_stream() as *mut std::ffi::c_void,
@@ -592,6 +884,12 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn cuda_ipc_handle_bytes_round_trip_without_signedness_loss() {
+        let bytes = std::array::from_fn(|index| (index as u8).wrapping_mul(131));
+        assert_eq!(ipc_handle_to_bytes(ipc_handle_from_bytes(bytes)), bytes);
+    }
 
     #[test]
     fn interleaves_gate_and_up_in_eight_row_groups() -> Result<()> {

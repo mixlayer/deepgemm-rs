@@ -20,7 +20,8 @@ pub use gemm::{
     fp8_gemm_nt_prepared_scales, prepare_fp8_gemm_scale,
 };
 pub use mega_moe::{
-    Bf16MegaMoeWorkspace, Sm90Fp8MegaMoeWorkspace, bf16_mega_moe,
+    Bf16MegaMoeWorkspace, PendingSm90Fp8MegaMoeWorkspace, SM90_FP8_MEGA_MOE_IPC_HANDLE_BYTES,
+    Sm90Fp8MegaMoeIpcHandle, Sm90Fp8MegaMoeWorkspace, bf16_mega_moe,
     interleave_bf16_mega_moe_l1_weights, interleave_mega_moe_l1_weights,
     interleave_up_gate_fp8_mega_moe_l1_weights, sm90_fp8_mega_moe,
 };
