@@ -15,6 +15,8 @@ pub enum DType {
     I32,
     /// Raw byte.
     U8,
+    /// 64-bit signed integer.
+    I64,
 }
 
 impl DType {
@@ -24,6 +26,7 @@ impl DType {
             Self::Fp8E4M3 | Self::PackedFp4E2M1 | Self::U8 => 1,
             Self::BF16 => 2,
             Self::PackedUe8M0 | Self::F32 | Self::I32 => 4,
+            Self::I64 => 8,
         }
     }
 
@@ -36,6 +39,7 @@ impl DType {
             Self::BF16 => deepgemm_sys::DEEPGEMM_DTYPE_BF16,
             Self::I32 => deepgemm_sys::DEEPGEMM_DTYPE_I32,
             Self::U8 => deepgemm_sys::DEEPGEMM_DTYPE_U8,
+            Self::I64 => deepgemm_sys::DEEPGEMM_DTYPE_I64,
         }
     }
 
@@ -48,6 +52,7 @@ impl DType {
             deepgemm_sys::DEEPGEMM_DTYPE_BF16 => Some(Self::BF16),
             deepgemm_sys::DEEPGEMM_DTYPE_I32 => Some(Self::I32),
             deepgemm_sys::DEEPGEMM_DTYPE_U8 => Some(Self::U8),
+            deepgemm_sys::DEEPGEMM_DTYPE_I64 => Some(Self::I64),
             _ => None,
         }
     }

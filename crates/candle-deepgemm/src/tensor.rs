@@ -75,6 +75,7 @@ pub(crate) mod cuda {
             DType::BF16 => tensor_ptr_typed::<half::bf16>(storage, start_offset, stream, name),
             DType::F32 => tensor_ptr_typed::<f32>(storage, start_offset, stream, name),
             DType::I32 => tensor_ptr_typed::<i32>(storage, start_offset, stream, name),
+            DType::I64 => tensor_ptr_typed::<i64>(storage, start_offset, stream, name),
             DType::U8 => tensor_ptr_typed::<u8>(storage, start_offset, stream, name),
             DType::F8E4M3 => {
                 tensor_ptr_typed::<float8::F8E4M3>(storage, start_offset, stream, name)
